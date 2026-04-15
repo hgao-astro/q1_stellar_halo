@@ -257,11 +257,13 @@ def fit_reference_isophotes(
     ref_img, ref_hdr = fits.getdata(reference_img_path, header=True)
     q0 = ref_hdr.get("IC_Q")
     eps0 = 0.0 if q0 is None else np.clip(1.0 - float(q0), 0.0, 0.95)
-    pa0 = np.deg2rad(float(ref_hdr.get("IC_PA", 0.0)))
     return extract_isophote(
         ref_img,
         eps=eps0,
-        pa=pa0,
+        # The stacks are pre-rotated to place the major axis on the image x-axis.
+        # Keep the fitted isophotes aligned to that axis instead of letting low-S/N
+        # outer regions wander to arbitrary position angles.
+        pa=0.0,
         maxsma=maxsma,
         step=step,
         integrmode=integrmode,
@@ -270,7 +272,7 @@ def fit_reference_isophotes(
         linear=linear,
         mode="fit",
         fix_center=True,
-        fix_pa=False,
+        fix_pa=True,
         fix_eps=False,
     )
 
