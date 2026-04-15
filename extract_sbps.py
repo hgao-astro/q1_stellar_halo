@@ -36,7 +36,7 @@ ncores = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
 
 FILTERS = ("I", "Y", "J", "H")
 GAL_TYPES = ("lcg", "hcg")
-REFERENCE_FILTER = "H"
+REFERENCE_FILTER = "I"
 
 
 def _normalize_sma_limits(img, minsma=None, maxsma=None):
