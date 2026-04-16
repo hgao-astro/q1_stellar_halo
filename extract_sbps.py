@@ -37,6 +37,12 @@ ncores = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
 FILTERS = ("I", "Y", "J", "H")
 GAL_TYPES = ("lcg", "hcg")
 REFERENCE_FILTER = "I"
+DEFAULT_REFERENCE_IMAGE_KIND = "wiener"
+REFERENCE_IMAGE_PRODUCTS = {
+    "predeconv": ("gal", "_subbkg"),
+    "imcascade": ("gal deconv imcascade", "_subbkg_deconv_imcascade"),
+    "wiener": ("gal deconv wiener", "_subbkg_deconv_wiener"),
+}
 
 
 def _normalize_sma_limits(img, minsma=None, maxsma=None):
@@ -245,8 +251,8 @@ def extract_isophote(
     )
 
 
-def fit_reference_isophotes(
-    reference_img_path,
+def fit_image_isophotes(
+    img_path,
     maxsma,
     integrmode="median",
     sclip=3,
@@ -254,7 +260,7 @@ def fit_reference_isophotes(
     step=0.1,
     linear=False,
 ):
-    ref_img, ref_hdr = fits.getdata(reference_img_path, header=True)
+    ref_img, ref_hdr = fits.getdata(img_path, header=True)
     q0 = ref_hdr.get("IC_Q")
     eps0 = 0.0 if q0 is None else np.clip(1.0 - float(q0), 0.0, 0.95)
     return extract_isophote(
@@ -357,9 +363,50 @@ def build_stack_path(gal_type, filter_name, z1, z2, m1, m2, q1, q2):
     )
 
 
-def build_sbp_path(gal_type, filter_name, z1, z2, m1, m2, q1, q2):
-    return (
+def build_image_product_paths(gal_img_path):
+    return {
+        "gal+bkg": gal_img_path,
+        "gal": gal_img_path.with_stem(gal_img_path.stem + "_subbkg"),
+        "gal deconv imcascade": gal_img_path.with_stem(
+            gal_img_path.stem + "_subbkg_deconv_imcascade"
+        ),
+        "gal deconv wiener": gal_img_path.with_stem(
+            gal_img_path.stem + "_subbkg_deconv_wiener"
+        ),
+    }
+
+
+def resolve_reference_image(gal_img_path, reference_image_kind):
+    try:
+        image_label, suffix = REFERENCE_IMAGE_PRODUCTS[reference_image_kind]
+    except KeyError as exc:
+        valid_kinds = ", ".join(REFERENCE_IMAGE_PRODUCTS)
+        raise ValueError(
+            f"Unsupported reference image kind: {reference_image_kind}. "
+            f"Expected one of: {valid_kinds}."
+        ) from exc
+    return image_label, gal_img_path.with_stem(gal_img_path.stem + suffix)
+
+
+def build_sbp_path(
+    gal_type,
+    filter_name,
+    z1,
+    z2,
+    m1,
+    m2,
+    q1,
+    q2,
+    isophote_source_filter=REFERENCE_FILTER,
+    reference_image_kind=DEFAULT_REFERENCE_IMAGE_KIND,
+):
+    base_path = (
         stack_dir / f"sbps_{gal_type}_{filter_name}_{z1}_{z2}_{m1}_{m2}_{q1}_{q2}.asdf"
+    )
+    if isophote_source_filter == filter_name:
+        return base_path
+    return base_path.with_stem(
+        base_path.stem + f"_refiso-{isophote_source_filter}-{reference_image_kind}"
     )
 
 
@@ -368,6 +415,9 @@ def extract_all_sbps(
     reference_isophotes,
     reference_img_path,
     output_path,
+    isophote_source_filter,
+    reference_filter=REFERENCE_FILTER,
+    reference_image_kind=DEFAULT_REFERENCE_IMAGE_KIND,
     integrmode="median",
     sclip=3,
     nclip=10,
@@ -383,52 +433,37 @@ def extract_all_sbps(
 
     All profiles are sampled on a common set of reference isophotes.
     """
-    gal_img_subbkg_path = gal_img_path.with_stem(gal_img_path.stem + "_subbkg")
-    gal_img_deconv_imcascade_path = gal_img_path.with_stem(
-        gal_img_path.stem + "_subbkg_deconv_imcascade"
-    )
-    gal_img_deconv_wiener_path = gal_img_path.with_stem(
-        gal_img_path.stem + "_subbkg_deconv_wiener"
-    )
-    required_paths = [
-        gal_img_path,
-        gal_img_subbkg_path,
-        gal_img_deconv_imcascade_path,
-        gal_img_deconv_wiener_path,
-    ]
+    image_paths = build_image_product_paths(gal_img_path)
+    reference_image_label = REFERENCE_IMAGE_PRODUCTS[reference_image_kind][0]
+
+    required_paths = list(image_paths.values())
     missing_paths = [path for path in required_paths if not path.exists()]
     if missing_paths:
         missing_str = ", ".join(str(path) for path in missing_paths)
         raise FileNotFoundError(f"Missing required image products: {missing_str}")
 
     sbp_dict = {
-        "reference filter": REFERENCE_FILTER,
+        "reference filter": isophote_source_filter,
+        "global reference filter": reference_filter,
+        "reference image mode": reference_image_kind,
+        "reference image product": reference_image_label,
         "reference image": str(reference_img_path.name),
     }
 
-    gal_img = fits.getdata(gal_img_path)
-    gal_img_subbkg = fits.getdata(gal_img_subbkg_path)
-    gal_img_deconv_imcascade = fits.getdata(gal_img_deconv_imcascade_path)
-    gal_img_deconv_wiener = fits.getdata(gal_img_deconv_wiener_path)
-
-    sbp_dict["gal+bkg"] = sample_image_to_table(
-        gal_img,
-        reference_isophotes=reference_isophotes,
-        integrmode=integrmode,
-        sclip=sclip,
-        nclip=nclip,
-        step=step,
-        linear=linear,
-    )
-    sbp_dict["gal"] = sample_image_to_table(
-        gal_img_subbkg,
-        reference_isophotes=reference_isophotes,
-        integrmode=integrmode,
-        sclip=sclip,
-        nclip=nclip,
-        step=step,
-        linear=linear,
-    )
+    image_data = {name: fits.getdata(path) for name, path in image_paths.items()}
+    for image_label, img in image_data.items():
+        if image_paths[image_label] == reference_img_path:
+            sbp_dict[image_label] = fix_table_dtype(reference_isophotes.to_table())
+            continue
+        sbp_dict[image_label] = sample_image_to_table(
+            img,
+            reference_isophotes=reference_isophotes,
+            integrmode=integrmode,
+            sclip=sclip,
+            nclip=nclip,
+            step=step,
+            linear=linear,
+        )
 
     sky_path = gal_img_path.with_stem(gal_img_path.stem + "_sky")
     sky_imgs = load_image_extensions(sky_path, nsky)
@@ -445,7 +480,7 @@ def extract_all_sbps(
             ncores=ncores,
         )
     else:
-        bkg = np.zeros_like(gal_img)
+        bkg = np.zeros_like(image_data["gal+bkg"])
         sbp_dict["sky"] = []
 
     bs_path = gal_img_path.with_stem(gal_img_path.stem + "_bs")
@@ -464,30 +499,6 @@ def extract_all_sbps(
         )
     else:
         sbp_dict["bootstrap"] = []
-
-    if gal_img_deconv_imcascade_path == reference_img_path:
-        sbp_dict["gal deconv imcascade"] = fix_table_dtype(
-            reference_isophotes.to_table()
-        )
-    else:
-        sbp_dict["gal deconv imcascade"] = sample_image_to_table(
-            gal_img_deconv_imcascade,
-            reference_isophotes=reference_isophotes,
-            integrmode=integrmode,
-            sclip=sclip,
-            nclip=nclip,
-            step=step,
-            linear=linear,
-        )
-    sbp_dict["gal deconv wiener"] = sample_image_to_table(
-        gal_img_deconv_wiener,
-        reference_isophotes=reference_isophotes,
-        integrmode=integrmode,
-        sclip=sclip,
-        nclip=nclip,
-        step=step,
-        linear=linear,
-    )
 
     if pixel_to_kpc is not None:
         sbp_dict["pixel_to_kpc"] = pixel_to_kpc
@@ -542,11 +553,23 @@ if __name__ == "__main__":
         default=100,
         help="Number of random bootstrap samples.",
     )
+    parser.add_argument(
+        "--reference-image-kind",
+        choices=tuple(REFERENCE_IMAGE_PRODUCTS),
+        default=DEFAULT_REFERENCE_IMAGE_KIND,
+        help=(
+            "Image product used for isophote fitting in each filter: "
+            "'predeconv' samples the background-subtracted stack before "
+            "deconvolution, 'imcascade' uses the imcascade deconvolved image, "
+            "and 'wiener' uses the Wiener deconvolved image."
+        ),
+    )
 
     args = parser.parse_args()
     z1, z2, m1, m2, q1, q2 = args.z1, args.z2, args.m1, args.m2, args.q1, args.q2
     nsky = args.nsky
     nbs = args.nbs
+    reference_image_kind = args.reference_image_kind
 
     avg_z = 0.5 * (z1 + z2)
     angular_diameter_distance = cosmo.angular_diameter_distance(avg_z)
@@ -571,18 +594,22 @@ if __name__ == "__main__":
             q1,
             q2,
         )
-        reference_img_path = reference_base_path.with_stem(
-            reference_base_path.stem + "_subbkg_deconv_imcascade"
+        reference_image_label, reference_img_path = resolve_reference_image(
+            reference_base_path, reference_image_kind
         )
         if not reference_img_path.exists():
             print(
-                f"Missing H-band reference image for {gal_type}: {reference_img_path}. "
+                f"Missing {REFERENCE_FILTER}-band {reference_image_label} "
+                f"for {gal_type}: {reference_img_path}. "
                 "Skipping this galaxy type."
             )
             continue
 
-        print(f"Fitting H-band reference isophotes from {reference_img_path}")
-        reference_isophotes = fit_reference_isophotes(
+        print(
+            f"Fitting {REFERENCE_FILTER}-band reference isophotes from "
+            f"{reference_img_path} ({reference_image_kind})."
+        )
+        reference_isophotes = fit_image_isophotes(
             reference_img_path,
             maxsma=maxsma,
             integrmode=integrmode,
@@ -596,20 +623,117 @@ if __name__ == "__main__":
             gal_img_path = build_stack_path(
                 gal_type, filter_name, z1, z2, m1, m2, q1, q2
             )
-            output_path = build_sbp_path(gal_type, filter_name, z1, z2, m1, m2, q1, q2)
             if not gal_img_path.exists():
                 print(f"Skipping missing stack: {gal_img_path}")
                 continue
+
+            filter_reference_label, filter_reference_img_path = resolve_reference_image(
+                gal_img_path, reference_image_kind
+            )
+            local_isophotes = (
+                reference_isophotes if filter_name == REFERENCE_FILTER else None
+            )
+
+            if filter_name != REFERENCE_FILTER:
+                if not filter_reference_img_path.exists():
+                    print(
+                        f"Skipping {gal_type} {filter_name}-band local isophote fit "
+                        f"because the {filter_reference_label} is missing: "
+                        f"{filter_reference_img_path}"
+                    )
+                else:
+                    print(
+                        f"Fitting {filter_name}-band isophotes from "
+                        f"{filter_reference_img_path} ({reference_image_kind})."
+                    )
+                    try:
+                        local_isophotes = fit_image_isophotes(
+                            filter_reference_img_path,
+                            maxsma=maxsma,
+                            integrmode=integrmode,
+                            sclip=sclip,
+                            nclip=nclip,
+                            step=step,
+                            linear=linear,
+                        )
+                    except RuntimeError as exc:
+                        print(
+                            f"Skipping {gal_type} {filter_name}-band local isophote fit "
+                            f"because fitting failed: {exc}"
+                        )
+
+            if local_isophotes is not None:
+                local_output_path = build_sbp_path(
+                    gal_type,
+                    filter_name,
+                    z1,
+                    z2,
+                    m1,
+                    m2,
+                    q1,
+                    q2,
+                    isophote_source_filter=filter_name,
+                    reference_image_kind=reference_image_kind,
+                )
+                print(
+                    f"Extracting SBPs for {gal_type} in {filter_name} band using "
+                    f"{filter_name}-band {reference_image_kind} isophotes -> "
+                    f"{local_output_path.name}"
+                )
+                try:
+                    extract_all_sbps(
+                        gal_img_path,
+                        reference_isophotes=local_isophotes,
+                        reference_img_path=filter_reference_img_path,
+                        output_path=local_output_path,
+                        isophote_source_filter=filter_name,
+                        reference_filter=REFERENCE_FILTER,
+                        reference_image_kind=reference_image_kind,
+                        integrmode=integrmode,
+                        sclip=sclip,
+                        nclip=nclip,
+                        nsky=nsky,
+                        nbs=nbs,
+                        pixel_to_kpc=pixel_to_kpc,
+                        ncores=ncores,
+                        step=step,
+                        linear=linear,
+                    )
+                except FileNotFoundError as exc:
+                    print(
+                        f"Skipping {gal_type} {filter_name}-band local SBPs due to "
+                        f"missing inputs: {exc}"
+                    )
+
+            if filter_name == REFERENCE_FILTER:
+                continue
+
+            reference_output_path = build_sbp_path(
+                gal_type,
+                filter_name,
+                z1,
+                z2,
+                m1,
+                m2,
+                q1,
+                q2,
+                isophote_source_filter=REFERENCE_FILTER,
+                reference_image_kind=reference_image_kind,
+            )
             print(
                 f"Extracting SBPs for {gal_type} in {filter_name} band using "
-                f"H-band reference isophotes."
+                f"{REFERENCE_FILTER}-band {reference_image_kind} isophotes -> "
+                f"{reference_output_path.name}"
             )
             try:
                 extract_all_sbps(
                     gal_img_path,
                     reference_isophotes=reference_isophotes,
                     reference_img_path=reference_img_path,
-                    output_path=output_path,
+                    output_path=reference_output_path,
+                    isophote_source_filter=REFERENCE_FILTER,
+                    reference_filter=REFERENCE_FILTER,
+                    reference_image_kind=reference_image_kind,
                     integrmode=integrmode,
                     sclip=sclip,
                     nclip=nclip,
@@ -622,5 +746,6 @@ if __name__ == "__main__":
                 )
             except FileNotFoundError as exc:
                 print(
-                    f"Skipping {gal_type} {filter_name}-band due to missing inputs: {exc}"
+                    f"Skipping {gal_type} {filter_name}-band reference-filter SBPs "
+                    f"due to missing inputs: {exc}"
                 )
