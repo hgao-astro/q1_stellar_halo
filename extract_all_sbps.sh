@@ -11,7 +11,7 @@ module load miniforge3-uoneasy/24.1.2-0
 eval "$(conda shell.bash hook)"
 conda activate icl-py313
 
-z_min=0.2   ; z_max=1.0   ; dz=0.1
+z_min=0.2   ; z_max=0.8   ; dz=0.1
 mass_bins=("9.0 9.5" "9.5 10.0" "10.0 10.5" "10.5 11.0" "11.0 11.5" "11.5 12.0")
 q_bins=("0.0 0.5" "0.5 1.0" "0.0 1.0")
 
