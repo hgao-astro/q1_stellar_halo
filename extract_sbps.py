@@ -1,6 +1,6 @@
 #!/gpfs01/home/ppzhg/.conda/envs/icl-py313/bin/python3
 # fmt: off
-#SBATCH --partition=defq
+#SBATCH --partition=defq,hmemq
 #SBATCH --mem=7g
 #SBATCH --cpus-per-task=10
 #SBATCH --time=5:00:00
@@ -37,10 +37,11 @@ ncores = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
 FILTERS = ("I", "Y", "J", "H")
 GAL_TYPES = ("lcg", "hcg")
 REFERENCE_FILTER = "I"
-DEFAULT_REFERENCE_IMAGE_KIND = "wiener"
+DEFAULT_REFERENCE_IMAGE_KIND = "pysersic"
+DEFAULT_FIT_SMA0 = 5.0
 REFERENCE_IMAGE_PRODUCTS = {
     "predeconv": ("gal", "_subbkg"),
-    "imcascade": ("gal deconv imcascade", "_subbkg_deconv_imcascade"),
+    "pysersic": ("gal deconv pysersic", "_subbkg_deconv_pysersic"),
     "wiener": ("gal deconv wiener", "_subbkg_deconv_wiener"),
 }
 
@@ -61,10 +62,10 @@ def _normalize_sma_limits(img, minsma=None, maxsma=None):
 
 def _default_sma0(minsma, maxsma, step, linear):
     if linear:
-        sma0 = min(10.0, maxsma - step)
+        sma0 = min(DEFAULT_FIT_SMA0, maxsma - step)
         sma0 = max(sma0, minsma + step)
     else:
-        sma0 = min(10.0, 0.5 * (minsma + maxsma))
+        sma0 = min(DEFAULT_FIT_SMA0, 0.5 * (minsma + maxsma))
         sma0 = max(sma0, minsma * (1 + step))
     if sma0 >= maxsma:
         sma0 = 0.5 * (minsma + maxsma)
@@ -254,6 +255,8 @@ def extract_isophote(
 def fit_image_isophotes(
     img_path,
     maxsma,
+    q1=None,
+    q2=None,
     integrmode="median",
     sclip=3,
     nclip=10,
@@ -261,8 +264,10 @@ def fit_image_isophotes(
     linear=False,
 ):
     ref_img, ref_hdr = fits.getdata(img_path, header=True)
-    q0 = ref_hdr.get("IC_Q")
-    eps0 = 0.0 if q0 is None else np.clip(1.0 - float(q0), 0.0, 0.95)
+    if q1 is None or q2 is None:
+        eps0 = 0.0
+    else:
+        eps0 = np.clip(1.0 - 0.5 * (float(q1) + float(q2)), 0.0, 0.95)
     return extract_isophote(
         ref_img,
         eps=eps0,
@@ -367,8 +372,8 @@ def build_image_product_paths(gal_img_path):
     return {
         "gal+bkg": gal_img_path,
         "gal": gal_img_path.with_stem(gal_img_path.stem + "_subbkg"),
-        "gal deconv imcascade": gal_img_path.with_stem(
-            gal_img_path.stem + "_subbkg_deconv_imcascade"
+        "gal deconv pysersic": gal_img_path.with_stem(
+            gal_img_path.stem + "_subbkg_deconv_pysersic"
         ),
         "gal deconv wiener": gal_img_path.with_stem(
             gal_img_path.stem + "_subbkg_deconv_wiener"
@@ -480,7 +485,7 @@ def extract_all_sbps(
             ncores=ncores,
         )
     else:
-        bkg = np.zeros_like(image_data["gal+bkg"])
+        bkg = np.zeros_like(image_data["gal"])
         sbp_dict["sky"] = []
 
     bs_path = gal_img_path.with_stem(gal_img_path.stem + "_bs")
@@ -560,7 +565,7 @@ if __name__ == "__main__":
         help=(
             "Image product used for isophote fitting in each filter: "
             "'predeconv' samples the background-subtracted stack before "
-            "deconvolution, 'imcascade' uses the imcascade deconvolved image, "
+            "deconvolution, 'pysersic' uses the pysersic deconvolved image, "
             "and 'wiener' uses the Wiener deconvolved image."
         ),
     )
@@ -612,6 +617,8 @@ if __name__ == "__main__":
         reference_isophotes = fit_image_isophotes(
             reference_img_path,
             maxsma=maxsma,
+            q1=q1,
+            q2=q2,
             integrmode=integrmode,
             sclip=sclip,
             nclip=nclip,
@@ -650,6 +657,8 @@ if __name__ == "__main__":
                         local_isophotes = fit_image_isophotes(
                             filter_reference_img_path,
                             maxsma=maxsma,
+                            q1=q1,
+                            q2=q2,
                             integrmode=integrmode,
                             sclip=sclip,
                             nclip=nclip,

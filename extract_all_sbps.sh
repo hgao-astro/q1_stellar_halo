@@ -30,8 +30,8 @@ for z1 in $(seq "$z_min" "$dz" "$(echo "$z_max - $dz" | bc)"); do
         for q_bin in "${q_bins[@]}"; do
             read -r q1 q2 <<< "$q_bin"
 
-            # Calculate delay in minutes (3 minutes per mass/q bin)
-            delay_minutes=$((mq_bin_index * 3))
+            # Calculate delay in minutes (1 minutes per mass/q bin)
+            delay_minutes=$((mq_bin_index * 1))
 
             echo "Submitting SBP extraction for z=[${z1},${z2}) logM=[${m1},${m2}) q=[${q1},${q2}) (delay: ${delay_minutes} min)"
             sbatch --begin=now+${delay_minutes}minutes ~/Q1_gal_stacks_rot/extract_sbps.py \
