@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=20g
+#SBATCH --mem=10g
 #SBATCH --time=1-00:00:00
 #SBATCH --job-name=deconv_gals
 #SBATCH --output=/gpfs01/home/ppzhg/logs/deconv_gals/%j.out
@@ -22,7 +22,7 @@ from astropy import units as u
 from astropy.cosmology import FlatLambdaCDM
 from astropy.io import fits
 from imcascade import Fitter
-from skimage.restoration import unsupervised_wiener
+from skimage.restoration import richardson_lucy, unsupervised_wiener
 
 cosmo = FlatLambdaCDM(
     H0=67.74 * u.km / u.s / u.Mpc,  # Hubble constant
@@ -36,6 +36,12 @@ psf_dir = Path("~/ero_psf").expanduser()
 pixel_scale = 0.3
 psf_oversamp = 3
 psf_scale = pixel_scale / psf_oversamp
+DECONV_SUFFIXES = {
+    "imcascade": "_deconv_imcascade",
+    "wiener": "_deconv_wiener",
+    "richardson_lucy": "_deconv_richardson_lucy",
+    "pysersic": "_deconv_pysersic",
+}
 
 
 def avg_bkg_stack(img_path_base, nsky=100):
@@ -71,72 +77,151 @@ def crop_center(arr, shape):
     return arr[y0 : y0 + Iy, x0 : x0 + Ix]
 
 
-def deconvolve_image(
-    gal_img_path,
-    psf_img,
-    sigma_psf,
-    norm_psf,
-    psf_fwhm_est,
-    pixel_scale=0.3,
-    bound_pix_rad=None,
+def pad_image_to_min_shape(img, min_shape):
+    """Pad `img` to at least `min_shape`, keeping the image centered."""
+    target_shape = tuple(max(cur, req) for cur, req in zip(img.shape, min_shape))
+    if target_shape == img.shape:
+        return img
+    return pad_image_centered(img, target_shape)
+
+
+def run_wiener(img, psf_img):
+    """Run unsupervised Wiener deconvolution, padding if needed."""
+    padded_img = pad_image_to_min_shape(img, psf_img.shape)
+    deconv_padded, _ = unsupervised_wiener(
+        padded_img,
+        psf_img,
+        clip=False,
+    )
+    return crop_center(deconv_padded, img.shape)
+
+
+def run_richardson_lucy(img, psf_img, num_iter):
+    """Run Richardson-Lucy on a non-negative image, padding if needed."""
+    rl_input = np.clip(img, 0.0, None)
+    padded_img = pad_image_to_min_shape(rl_input, psf_img.shape)
+    deconv_padded = richardson_lucy(
+        padded_img,
+        psf_img,
+        num_iter=num_iter,
+        clip=False,
+    )
+    return crop_center(deconv_padded, img.shape)
+
+
+def make_delta_psf(psf_img):
+    """Return a delta-function PSF on the same grid as `psf_img`."""
+    delta_psf = np.zeros_like(psf_img, dtype=np.float32)
+    cy, cx = np.asarray(psf_img.shape) // 2
+    delta_psf[cy, cx] = 1.0
+    return delta_psf
+
+
+def crop_psf_for_fit(psf_img, image_shape, flux_frac=0.997):
+    """Center-crop the PSF to a stamp smaller than the science image."""
+    psf_img = np.asarray(psf_img, dtype=np.float32)
+    psf_img = psf_img / np.sum(psf_img)
+    cy, cx = np.asarray(psf_img.shape) // 2
+    yy, xx = np.indices(psf_img.shape)
+    rr = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+
+    max_half_size = max(1, min(image_shape) // 2 - 1)
+    order = np.argsort(rr.ravel())
+    rr_sorted = rr.ravel()[order]
+    flux_sorted = psf_img.ravel()[order]
+    cflux = np.cumsum(flux_sorted)
+    target_idx = np.searchsorted(cflux, flux_frac)
+    target_rad = rr_sorted[min(target_idx, rr_sorted.size - 1)]
+    half_size = int(np.ceil(target_rad))
+    half_size = min(max(1, half_size), max_half_size)
+
+    y0 = cy - half_size
+    y1 = cy + half_size + 1
+    x0 = cx - half_size
+    x1 = cx + half_size + 1
+    cropped = psf_img[y0:y1, x0:x1].copy()
+    cropped /= np.sum(cropped)
+    return cropped
+
+
+def run_pysersic_map(
+    fitter,
+    rkey,
+    init_values=None,
+    max_train=500,
+    patience=75,
+    num_round=2,
+    lr_init=0.05,
+    frac_lr_decrease=0.1,
 ):
-    """
-    Deconvolve a galaxy image using both imcascade and Wiener methods.
+    """Run pysersic's MAP optimizer with adjustable early-stopping settings."""
+    from numpyro import infer, optim
+    from numpyro.handlers import condition, trace
+    from numpyro.infer import SVI, Trace_ELBO
+    from pysersic.pysersic import train_numpyro_svi_early_stop
 
-    Parameters
-    ----------
-    gal_img_path : Path
-        Path to the galaxy image FITS file. The file should contain:
-        - HDU 0: Galaxy image data
-        - HDU 2: RMS/error map
-    psf_img : numpy.ndarray
-        The PSF image (normalized).
-    sigma_psf : numpy.ndarray
-        PSF sigma values from MGE decomposition.
-    norm_psf : numpy.ndarray
-        PSF normalization values from MGE decomposition.
-    psf_fwhm_est : float
-        Estimated PSF FWHM in arcsec.
-    pixel_scale : float, optional
-        Pixel scale in arcsec/pixel. Default is 0.3.
-    bound_pix_rad : float, optional
-        Radius in pixels to bound the image for parameter estimation.
-        If None, uses the full image.
+    model_cur = fitter.build_model(return_model=True)
+    if init_values is None:
+        init_values = {}
+    init_loc_fn = infer.init_to_value(values=init_values)
 
-    Returns
-    -------
-    deconv_imcascade : numpy.ndarray
-        Image deconvolved with imcascade method.
-    deconv_wiener : numpy.ndarray
-        Image deconvolved with Wiener method.
-    """
-    # Read galaxy image, mask, and RMS from FITS file and sanitize invalid pixels.
-    with fits.open(gal_img_path) as hdul:
-        gal_img = np.asarray(hdul[0].data, dtype=np.float64)
-        gal_mask = np.zeros_like(gal_img, dtype=bool)
-        if len(hdul) > 1 and hdul[1].data is not None:
-            gal_mask |= np.asarray(hdul[1].data, dtype=bool)
-        gal_rms = np.asarray(hdul[2].data, dtype=np.float64)
+    autoguide_map = infer.autoguide.AutoDelta(
+        model_cur,
+        init_loc_fn=init_loc_fn,
+    )
+    svi_kernel = SVI(model_cur, autoguide_map, optim.Adam(0.01), loss=Trace_ELBO())
+    res = train_numpyro_svi_early_stop(
+        svi_kernel,
+        rkey=rkey,
+        lr_init=lr_init,
+        num_round=num_round,
+        frac_lr_decrease=frac_lr_decrease,
+        patience=patience,
+        optimizer=optim.Adam,
+        max_train=max_train,
+    )
 
-    bad_img = ~np.isfinite(gal_img)
-    bad_rms = (~np.isfinite(gal_rms)) | (gal_rms <= 0)
-    bad_pix = gal_mask | bad_img | bad_rms
-    if np.any(bad_pix):
-        print(
-            "Masking"
-            f" {bad_pix.sum()} invalid pixels"
-            f" ({bad_img.sum()} bad image, {bad_rms.sum()} bad RMS)"
-        )
+    use_dict = {}
+    for key in res.params.keys():
+        pref = key.split("_auto_loc")[0]
+        use_dict[pref] = res.params[key]
 
-    gal_img = gal_img.copy()
-    gal_img[bad_pix] = 0.0
-    weight = np.zeros_like(gal_rms, dtype=np.float64)
-    good_pix = ~bad_pix
-    weight[good_pix] = 1.0 / gal_rms[good_pix] ** 2
-    if not np.any(weight > 0):
-        raise ValueError(f"No valid pixels available for fitting in {gal_img_path}.")
+    trace_out = trace(condition(model_cur, use_dict)).get_trace()
+    real_out = {}
+    for key in trace_out:
+        if "Loss" in key:
+            continue
+        if key == "model":
+            real_out[key] = np.asarray(trace_out[key]["value"])
+        elif not (
+            "base" in key
+            or "auto" in key
+            or "unwrapped" in key
+            or "factor" in key
+            or "loss" in key
+        ):
+            real_out[key] = np.round(trace_out[key]["value"], 5)
+    return real_out
 
-    # estimate some galaxy parameters
+
+def write_deconvolved_image(gal_img_path, method, img, psf_fwhm_est, extra_header=None):
+    """Write the deconvolved image for a single method."""
+    hdr = fits.Header()
+    hdr["PSF_FWHM"] = (psf_fwhm_est, "PSF FWHM in arcsec")
+    hdr["DECMETH"] = (method, "Deconvolution method")
+    if extra_header is not None:
+        for key, value in extra_header.items():
+            hdr[key] = value
+    fits.writeto(
+        gal_img_path.with_stem(gal_img_path.stem + DECONV_SUFFIXES[method]),
+        img,
+        header=hdr,
+        overwrite=True,
+    )
+
+
+def estimate_galaxy_parameters(gal_img_path, pixel_scale=0.3, bound_pix_rad=None):
+    """Estimate galaxy flux and effective radius for imcascade initialization."""
     gal_img_ = galsim.fits.read(
         str(gal_img_path)
     )  # galsim is not compatible with pathlib!
@@ -167,94 +252,407 @@ def deconvolve_image(
         "Estimated galaxy effective radius:"
         f" {gal_re_est} arcsec ({gal_re_est_pix} pixels)"
     )
+    return gal_flux_est, gal_re_est, gal_re_est_pix
 
-    # imcascade deconvolution
-    sig = np.geomspace(
-        psf_fwhm_est / pixel_scale / 2, gal_re_est / pixel_scale * 20, num=10
+
+def run_pysersic_doublesersic(
+    gal_img,
+    gal_rms,
+    bad_pix,
+    psf_img,
+    theta_max_deg=10.0,
+    theta_sigma_deg=5.0,
+    inner_q_bounds=(0.2, 1.0),
+    inner_q_init=0.6,
+    outer_q_bounds=(0.2, 1.0),
+    outer_q_init=0.8,
+    max_train=500,
+    patience=75,
+    num_round=2,
+):
+    """
+    Fit a background-subtracted image with a pysersic doublesersic model.
+
+    This follows the pysersic single-source and multi-profile docs:
+    - use `SourceProperties(...).generate_prior("doublesersic", sky_type="none")`
+    - fit with `FitSingle(...).find_MAP(...)`
+    - render an intrinsic model separately by swapping in a delta-function PSF
+    """
+    try:
+        import jax.numpy as jnp
+        from jax.random import PRNGKey
+        from pysersic import FitSingle, check_input_data
+        from pysersic.loss import student_t_loss
+        from pysersic.priors import SourceProperties
+        from pysersic.rendering import HybridRenderer
+    except (ImportError, AttributeError) as exc:
+        raise ImportError(
+            "The `pysersic` deconvolution path requires a compatible `pysersic`"
+            " runtime. The tested combination here is `pysersic==0.1.5` with"
+            " `arviz<1`, plus its `jax` dependencies."
+        ) from exc
+
+    fit_img = np.asarray(gal_img, dtype=np.float32)
+    fit_mask = np.asarray(bad_pix, dtype=bool)
+    fit_rms = np.asarray(gal_rms, dtype=np.float32)
+    good_rms = fit_rms[~fit_mask & np.isfinite(fit_rms) & (fit_rms > 0)]
+    if good_rms.size == 0:
+        raise ValueError("No positive RMS values available for pysersic fitting.")
+    fill_rms = np.float32(np.nanmedian(good_rms))
+    fit_rms = np.where(
+        np.isfinite(fit_rms) & (fit_rms > 0),
+        fit_rms,
+        fill_rms,
     )
-    fitter = Fitter(
-        gal_img,
-        sig,
-        sigma_psf,
-        norm_psf,
-        weight=weight,
-        mask=bad_pix,
-        sky_model=False,
-        init_dict={
-            # imcascade expects `re` in the same units as `sig`, i.e. pixels.
-            "re": gal_re_est_pix,
-            "flux": gal_flux_est,
-            "q": 0.5 * (q1 + q2),
-            # imcascade's internal +x is NumPy axis 0; the displayed horizontal
-            # image axis is therefore its +y. phi=pi/2 puts the major axis along
-            # the displayed horizontal axis for the untransposed FITS image.
-            "phi": np.pi / 2,
-        },
-        # bounds_dict={"q": (0.999, 1.0)},
-    )
-    min_res = fitter.run_ls_min()
-    best_fit_q = min_res[2]
-    best_fit_phi = min_res[3]
-    best_fit_phi_display = (best_fit_phi - np.pi / 2) % np.pi
-    best_fit_pa_img_deg = np.degrees(best_fit_phi_display)
-    best_fit_pa_xaxis_deg = min(best_fit_pa_img_deg, 180.0 - best_fit_pa_img_deg)
-    if best_fit_pa_xaxis_deg > 10.0:
-        warnings.warn(
-            f"Best-fit PA is {best_fit_pa_xaxis_deg:.3f} deg from x-axis, exceeding 10 deg."
+    fit_rms[fit_mask] = fill_rms
+    fit_psf = crop_psf_for_fit(psf_img, fit_img.shape)
+    check_input_data(data=fit_img, rms=fit_rms, psf=fit_psf, mask=fit_mask)
+
+    # SourceProperties uses photutils-derived source estimates. Suppress
+    # negative sky fluctuations only for prior construction; the actual fit uses
+    # the original background-subtracted image.
+    prior_img = np.clip(fit_img, 0.0, None)
+    props = SourceProperties(image=prior_img, mask=fit_mask)
+    props.set_theta_guess(0.0)
+    prior = props.generate_prior("doublesersic", sky_type="none")
+
+    inner_q_low, inner_q_high = np.sort(np.asarray(inner_q_bounds, dtype=np.float64))
+    inner_q_low = np.clip(inner_q_low, 0.1, 1.0)
+    inner_q_high = np.clip(inner_q_high, inner_q_low, 1.0)
+    if inner_q_high <= inner_q_low:
+        inner_q_low = max(0.1, inner_q_low - 1e-3)
+        inner_q_high = min(1.0, inner_q_low + 1e-3)
+    outer_q_low, outer_q_high = np.sort(np.asarray(outer_q_bounds, dtype=np.float64))
+    outer_q_low = np.clip(outer_q_low, 0.1, 1.0)
+    outer_q_high = np.clip(outer_q_high, outer_q_low, 1.0)
+    if outer_q_high <= outer_q_low:
+        outer_q_low = max(0.1, outer_q_low - 1e-3)
+        outer_q_high = min(1.0, outer_q_low + 1e-3)
+    inner_q_init = float(np.clip(inner_q_init, inner_q_low, inner_q_high))
+    outer_q_init = float(np.clip(outer_q_init, outer_q_low, outer_q_high))
+
+    if hasattr(prior, "set_truncated_gaussian_prior"):
+        prior.set_truncated_gaussian_prior(
+            "theta",
+            0.0,
+            np.deg2rad(theta_sigma_deg),
+            low=-np.deg2rad(theta_max_deg),
+            high=np.deg2rad(theta_max_deg),
         )
+    if hasattr(prior, "set_uniform_prior"):
+        prior.set_uniform_prior("ellip_1", 1.0 - inner_q_high, 1.0 - inner_q_low)
+        prior.set_uniform_prior("ellip_2", 1.0 - outer_q_high, 1.0 - outer_q_low)
+
+    ny, nx = fit_img.shape
+    xc_init = 0.5 * (nx - 1)
+    yc_init = 0.5 * (ny - 1)
+    init_values = {
+        "theta": 0.0,
+        "ellip_1": 1.0 - inner_q_init,
+        "ellip_2": 1.0 - outer_q_init,
+        "xc": xc_init,
+        "yc": yc_init,
+    }
     print(
-        "imcascade best-fit shape:"
-        f" q={best_fit_q:.6f},"
-        f" PA={best_fit_pa_xaxis_deg:.3f} deg from x-axis"
+        "pysersic priors:"
+        f" theta~N(0,{theta_sigma_deg:.1f} deg)"
+        f" truncated to +/-{theta_max_deg:.1f} deg,"
+        f" q_inner in [{inner_q_low:.3f}, {inner_q_high:.3f}],"
+        f" q_outer in [{outer_q_low:.3f}, {outer_q_high:.3f}]"
     )
-    fitter.save_results(
-        gal_img_path.with_suffix(".asdf").with_stem(
-            gal_img_path.stem + "_deconv_imcascade"
-        )
-    )
-    # add back residuals to the model image
-    conv_model_img = fitter.make_model(fitter.min_param)
-    resid = gal_img - conv_model_img
-    fitter.has_psf = False
-    deconv_imcascade = fitter.make_model(fitter.min_param) + resid
-    deconv_imcascade[bad_pix] = np.nan
-    # generate a minimum header for the imcascade deconvolved image
-    hdr = fits.Header()
-    hdr["PSF_FWHM"] = (psf_fwhm_est, "PSF FWHM in arcsec")
-    hdr["IC_Q"] = (best_fit_q, "imcascade best-fit axis ratio")
-    hdr["IC_PA"] = (best_fit_pa_xaxis_deg, "imcascade PA in deg from x-axis")
-    fits.writeto(
-        gal_img_path.with_stem(gal_img_path.stem + "_deconv_imcascade"),
-        deconv_imcascade,
-        header=hdr,
-        overwrite=True,
+    print(
+        "pysersic init:"
+        f" q_inner={inner_q_init:.3f},"
+        f" q_outer={outer_q_init:.3f},"
+        f" xc={xc_init:.3f},"
+        f" yc={yc_init:.3f}"
     )
 
-    # Wiener deconvolution
-    if gal_img.size < psf_img.size:
-        gal_img_padded = pad_image_centered(gal_img, psf_img.shape)
-        gal_deconv_padded, _ = unsupervised_wiener(
-            gal_img_padded,
-            psf_img,
-            clip=False,
-        )
-        deconv_wiener = crop_center(gal_deconv_padded, gal_img.shape)
-    else:
-        deconv_wiener, _ = unsupervised_wiener(
-            gal_img,
-            psf_img,
-            clip=False,
-        )
-    deconv_wiener[bad_pix] = np.nan
-    # generate a minimum header for the wiener deconvolved image
-    hdr = fits.Header()
-    hdr["PSF_FWHM"] = (psf_fwhm_est, "PSF FWHM in arcsec")
-    fits.writeto(
-        gal_img_path.with_stem(gal_img_path.stem + "_deconv_wiener"),
-        deconv_wiener,
-        header=hdr,
-        overwrite=True,
+    fitter = FitSingle(
+        data=fit_img,
+        rms=fit_rms,
+        mask=fit_mask,
+        psf=fit_psf,
+        prior=prior,
+        loss_func=student_t_loss,
     )
+    print(
+        "Running pysersic MAP:"
+        f" max_train={max_train}, patience={patience}, num_round={num_round}"
+    )
+    map_params = run_pysersic_map(
+        fitter,
+        rkey=PRNGKey(1000),
+        init_values=init_values,
+        max_train=max_train,
+        patience=patience,
+        num_round=num_round,
+    )
+    fit_params = {
+        key: np.asarray(value).item() if np.asarray(value).shape == () else value
+        for key, value in map_params.items()
+        if key != "model"
+    }
+
+    if "model" in map_params:
+        conv_model_img = np.asarray(map_params["model"], dtype=np.float64)
+    else:
+        conv_renderer = HybridRenderer(
+            fit_img.shape,
+            jnp.array(fit_psf.astype(np.float32)),
+        )
+        conv_model_img = np.asarray(
+            conv_renderer.render_source(fit_params, profile_type="doublesersic"),
+            dtype=np.float64,
+        )
+
+    intrinsic_renderer = HybridRenderer(
+        fit_img.shape,
+        jnp.array(make_delta_psf(fit_psf)),
+    )
+    intrinsic_model_img = np.asarray(
+        intrinsic_renderer.render_source(fit_params, profile_type="doublesersic"),
+        dtype=np.float64,
+    )
+    return intrinsic_model_img, conv_model_img, fit_params
+
+
+def deconvolve_image(
+    gal_img_path,
+    psf_img,
+    sigma_psf,
+    norm_psf,
+    psf_fwhm_est,
+    method,
+    axis_ratio_init,
+    axis_ratio_bounds=None,
+    pixel_scale=0.3,
+    bound_pix_rad=None,
+    rl_num_iter=4,
+    pysersic_max_train=500,
+    pysersic_patience=75,
+    pysersic_num_round=2,
+):
+    """
+    Deconvolve a galaxy image with a single specified method.
+
+    Parameters
+    ----------
+    gal_img_path : Path
+        Path to the galaxy image FITS file. The file should contain:
+        - HDU 0: Galaxy image data
+        - HDU 2: RMS/error map
+    psf_img : numpy.ndarray
+        The PSF image (normalized).
+    sigma_psf : numpy.ndarray
+        PSF sigma values from MGE decomposition.
+    norm_psf : numpy.ndarray
+        PSF normalization values from MGE decomposition.
+    psf_fwhm_est : float
+        Estimated PSF FWHM in arcsec.
+    method : {"imcascade", "wiener", "richardson_lucy", "pysersic"}
+        The single deconvolution method to apply.
+    axis_ratio_init : float
+        Initial axis ratio used by imcascade and as the inner q initialization for
+        pysersic.
+    axis_ratio_bounds : tuple[float, float], optional
+        Axis-ratio range from the input bin, used as the inner q prior for pysersic.
+    pixel_scale : float, optional
+        Pixel scale in arcsec/pixel. Default is 0.3.
+    bound_pix_rad : float, optional
+        Radius in pixels to bound the image for parameter estimation.
+        If None, uses the full image.
+    rl_num_iter : int, optional
+        Number of Richardson-Lucy iterations when that method is used.
+    pysersic_max_train : int, optional
+        Maximum training steps per round for pysersic MAP fitting.
+    pysersic_patience : int, optional
+        Early-stopping patience per round for pysersic MAP fitting.
+    pysersic_num_round : int, optional
+        Number of learning-rate rounds for pysersic MAP fitting.
+    """
+    # Read galaxy image, mask, and RMS from FITS file and sanitize invalid pixels.
+    with fits.open(gal_img_path) as hdul:
+        gal_img = np.asarray(hdul[0].data, dtype=np.float64)
+        gal_mask = np.zeros_like(gal_img, dtype=bool)
+        if len(hdul) > 1 and hdul[1].data is not None:
+            gal_mask |= np.asarray(hdul[1].data, dtype=bool)
+        gal_rms = np.asarray(hdul[2].data, dtype=np.float64)
+
+    bad_img = ~np.isfinite(gal_img)
+    bad_rms = (~np.isfinite(gal_rms)) | (gal_rms <= 0)
+    bad_pix = gal_mask | bad_img | bad_rms
+    if np.any(bad_pix):
+        print(
+            "Masking"
+            f" {bad_pix.sum()} invalid pixels"
+            f" ({bad_img.sum()} bad image, {bad_rms.sum()} bad RMS)"
+        )
+
+    gal_img = gal_img.copy()
+    gal_img[bad_pix] = 0.0
+    weight = np.zeros_like(gal_rms, dtype=np.float64)
+    good_pix = ~bad_pix
+    weight[good_pix] = 1.0 / gal_rms[good_pix] ** 2
+    if not np.any(weight > 0):
+        raise ValueError(f"No valid pixels available for fitting in {gal_img_path}.")
+
+    if method == "imcascade":
+        gal_flux_est, gal_re_est, gal_re_est_pix = estimate_galaxy_parameters(
+            gal_img_path,
+            pixel_scale=pixel_scale,
+            bound_pix_rad=bound_pix_rad,
+        )
+        # imcascade deconvolution
+        sig = np.geomspace(
+            psf_fwhm_est / pixel_scale / 2, gal_re_est / pixel_scale * 20, num=10
+        )
+        fitter = Fitter(
+            gal_img,
+            sig,
+            sigma_psf,
+            norm_psf,
+            weight=weight,
+            mask=bad_pix,
+            sky_model=False,
+            init_dict={
+                # imcascade expects `re` in the same units as `sig`, i.e. pixels.
+                "re": gal_re_est_pix,
+                "flux": gal_flux_est,
+                "q": axis_ratio_init,
+                # imcascade's internal +x is NumPy axis 0; the displayed horizontal
+                # image axis is therefore its +y. phi=pi/2 puts the major axis along
+                # the displayed horizontal axis for the untransposed FITS image.
+                "phi": np.pi / 2,
+            },
+            bounds_dict={
+                "phi": (np.pi / 2 - np.deg2rad(10), np.pi / 2 + np.deg2rad(10)),
+                "q": (0.2, 1.0),
+            },
+        )
+        min_res = fitter.run_ls_min()
+        best_fit_q = min_res[2]
+        best_fit_phi = min_res[3]
+        best_fit_phi_display = (best_fit_phi - np.pi / 2) % np.pi
+        best_fit_pa_img_deg = np.degrees(best_fit_phi_display)
+        best_fit_pa_xaxis_deg = min(best_fit_pa_img_deg, 180.0 - best_fit_pa_img_deg)
+        if best_fit_pa_xaxis_deg > 10.0:
+            warnings.warn(
+                f"Best-fit PA is {best_fit_pa_xaxis_deg:.3f} deg from x-axis, exceeding 10 deg."
+            )
+        print(
+            "imcascade best-fit shape:"
+            f" q={best_fit_q:.6f},"
+            f" PA={best_fit_pa_xaxis_deg:.3f} deg from x-axis"
+        )
+        fitter.save_results(
+            gal_img_path.with_suffix(".asdf").with_stem(
+                gal_img_path.stem + "_deconv_imcascade"
+            )
+        )
+        # add back residuals to the model image
+        conv_model_img = fitter.make_model(fitter.min_param)
+        resid = gal_img - conv_model_img
+        fitter.has_psf = False
+        deconv_img = fitter.make_model(fitter.min_param) + resid
+        deconv_img[bad_pix] = np.nan
+        write_deconvolved_image(
+            gal_img_path,
+            method,
+            deconv_img,
+            psf_fwhm_est,
+            extra_header={
+                "IC_Q": (best_fit_q, "imcascade best-fit axis ratio"),
+                "IC_PA": (best_fit_pa_xaxis_deg, "imcascade PA in deg from x-axis"),
+            },
+        )
+        return
+
+    if method == "wiener":
+        deconv_img = run_wiener(gal_img, psf_img)
+        deconv_img[bad_pix] = np.nan
+        write_deconvolved_image(
+            gal_img_path,
+            method,
+            deconv_img,
+            psf_fwhm_est,
+        )
+        return
+
+    if method == "richardson_lucy":
+        clipped_input_count = int(np.sum(gal_img < 0))
+        if clipped_input_count > 0:
+            print(
+                "Clipping"
+                f" {clipped_input_count} negative input pixels to zero before"
+                " Richardson-Lucy."
+            )
+        deconv_img = run_richardson_lucy(gal_img, psf_img, rl_num_iter)
+        deconv_img[bad_pix] = np.nan
+        write_deconvolved_image(
+            gal_img_path,
+            method,
+            deconv_img,
+            psf_fwhm_est,
+            extra_header={
+                "DECITER": (rl_num_iter, "RL iterations"),
+                "DECLIP": (clipped_input_count > 0, "Negative input clipped to zero"),
+            },
+        )
+        return
+
+    if method == "pysersic":
+        if axis_ratio_bounds is None:
+            raise ValueError("pysersic requires `axis_ratio_bounds` to be provided.")
+        intrinsic_model_img, conv_model_img, fit_params = run_pysersic_doublesersic(
+            gal_img,
+            gal_rms,
+            bad_pix,
+            psf_img,
+            inner_q_bounds=axis_ratio_bounds,
+            inner_q_init=axis_ratio_init,
+            outer_q_bounds=(0.2, 1.0),
+            outer_q_init=0.8,
+            max_train=pysersic_max_train,
+            patience=pysersic_patience,
+            num_round=pysersic_num_round,
+        )
+        resid = gal_img - conv_model_img
+        deconv_img = intrinsic_model_img + resid
+        deconv_img[bad_pix] = np.nan
+        extra_header = {
+            "PYPROF": ("doublesersic", "pysersic profile type"),
+            "PYNROUND": (pysersic_num_round, "pysersic MAP learning-rate rounds"),
+            "PYMTRN": (pysersic_max_train, "pysersic MAP max steps per round"),
+            "PYPAT": (pysersic_patience, "pysersic MAP early-stop patience"),
+        }
+        header_map = {
+            "flux": "PYFLUX",
+            "f_1": "PYF1",
+            "r_eff_1": "PYRE1",
+            "r_eff_2": "PYRE2",
+            "ellip_1": "PYE1",
+            "ellip_2": "PYE2",
+            "theta": "PYTHETA",
+            "n_1": "PYN1",
+            "n_2": "PYN2",
+            "n": "PYN",
+            "xc": "PYXC",
+            "yc": "PYYC",
+        }
+        for key, hdr_key in header_map.items():
+            if key in fit_params:
+                extra_header[hdr_key] = (float(np.asarray(fit_params[key])), key)
+        write_deconvolved_image(
+            gal_img_path,
+            method,
+            deconv_img,
+            psf_fwhm_est,
+            extra_header=extra_header,
+        )
+        return
+
+    raise ValueError(f"Unknown deconvolution method: {method}")
 
 
 if __name__ == "__main__":
@@ -297,6 +695,36 @@ if __name__ == "__main__":
         choices=["I", "Y", "J", "H"],
         help="Filter (I, Y, J, H)",
     )
+    parser.add_argument(
+        "--deconv-method",
+        choices=["imcascade", "wiener", "richardson_lucy", "pysersic"],
+        required=True,
+        help="Single deconvolution method to apply.",
+    )
+    parser.add_argument(
+        "--rl-num-iter",
+        type=int,
+        default=4,
+        help="Number of Richardson-Lucy iterations when that method is used.",
+    )
+    parser.add_argument(
+        "--pysersic-max-train",
+        type=int,
+        default=500,
+        help="Maximum pysersic MAP optimizer steps per round.",
+    )
+    parser.add_argument(
+        "--pysersic-patience",
+        type=int,
+        default=75,
+        help="Pysersic MAP early-stopping patience per round.",
+    )
+    parser.add_argument(
+        "--pysersic-num-round",
+        type=int,
+        default=2,
+        help="Number of pysersic MAP learning-rate rounds.",
+    )
     args = parser.parse_args()
     z1, z2, m1, m2, q1, q2, filter = (
         args.z1,
@@ -307,8 +735,19 @@ if __name__ == "__main__":
         args.q2,
         args.filter,
     )
+    deconv_method = args.deconv_method
+    rl_num_iter = args.rl_num_iter
+    pysersic_max_train = args.pysersic_max_train
+    pysersic_patience = args.pysersic_patience
+    pysersic_num_round = args.pysersic_num_round
     print(
         f"Deconvolving the stack image in z={z1}-{z2} and m={m1}-{m2} and q={q1}-{q2} in {filter} band..."
+    )
+    print(
+        f"Selected deconvolution method: {deconv_method}"
+        f" (RL iterations={rl_num_iter},"
+        f" pysersic max_train={pysersic_max_train},"
+        f" patience={pysersic_patience}, rounds={pysersic_num_round})"
     )
 
     avg_z = 0.5 * (z1 + z2)
@@ -368,8 +807,15 @@ if __name__ == "__main__":
             sigma_psf,
             norm_psf,
             psf_fwhm_est,
+            method=deconv_method,
+            axis_ratio_init=0.5 * (q1 + q2),
+            axis_ratio_bounds=(q1, q2),
             pixel_scale=pixel_scale,
             bound_pix_rad=bound_pix_rad,
+            rl_num_iter=rl_num_iter,
+            pysersic_max_train=pysersic_max_train,
+            pysersic_patience=pysersic_patience,
+            pysersic_num_round=pysersic_num_round,
         )
 
     # deconvolve the HCG image
@@ -393,6 +839,13 @@ if __name__ == "__main__":
             sigma_psf,
             norm_psf,
             psf_fwhm_est,
+            method=deconv_method,
+            axis_ratio_init=0.5 * (q1 + q2),
+            axis_ratio_bounds=(q1, q2),
             pixel_scale=pixel_scale,
             bound_pix_rad=bound_pix_rad,
+            rl_num_iter=rl_num_iter,
+            pysersic_max_train=pysersic_max_train,
+            pysersic_patience=pysersic_patience,
+            pysersic_num_round=pysersic_num_round,
         )
