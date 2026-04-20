@@ -77,6 +77,22 @@ def crop_center(arr, shape):
     return arr[y0 : y0 + Iy, x0 : x0 + Ix]
 
 
+def get_center_crop_slices(shape, half_size):
+    """Return slices for a centered square cutout."""
+    if half_size is None:
+        return slice(0, shape[0]), slice(0, shape[1])
+    ny, nx = shape
+    max_half_size = max(1, min(ny, nx) // 2 - 1)
+    half_size = int(np.clip(np.round(half_size), 1, max_half_size))
+    cx = 0.5 * (nx - 1)
+    cy = 0.5 * (ny - 1)
+    x0 = max(0, int(np.floor(cx - half_size)))
+    x1 = min(nx, int(np.ceil(cx + half_size + 1)))
+    y0 = max(0, int(np.floor(cy - half_size)))
+    y1 = min(ny, int(np.ceil(cy + half_size + 1)))
+    return slice(y0, y1), slice(x0, x1)
+
+
 def pad_image_to_min_shape(img, min_shape):
     """Pad `img` to at least `min_shape`, keeping the image centered."""
     target_shape = tuple(max(cur, req) for cur, req in zip(img.shape, min_shape))
@@ -117,23 +133,16 @@ def make_delta_psf(psf_img):
     return delta_psf
 
 
-def crop_psf_for_fit(psf_img, image_shape, flux_frac=0.997):
-    """Center-crop the PSF to a stamp smaller than the science image."""
+def crop_psf_for_fit(psf_img, image_shape):
+    """Center-crop the PSF to the largest legal stamp for `image_shape`."""
     psf_img = np.asarray(psf_img, dtype=np.float32)
     psf_img = psf_img / np.sum(psf_img)
     cy, cx = np.asarray(psf_img.shape) // 2
-    yy, xx = np.indices(psf_img.shape)
-    rr = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
-
     max_half_size = max(1, min(image_shape) // 2 - 1)
-    order = np.argsort(rr.ravel())
-    rr_sorted = rr.ravel()[order]
-    flux_sorted = psf_img.ravel()[order]
-    cflux = np.cumsum(flux_sorted)
-    target_idx = np.searchsorted(cflux, flux_frac)
-    target_rad = rr_sorted[min(target_idx, rr_sorted.size - 1)]
-    half_size = int(np.ceil(target_rad))
-    half_size = min(max(1, half_size), max_half_size)
+    max_psf_half_size = min(
+        cy, cx, psf_img.shape[0] - cy - 1, psf_img.shape[1] - cx - 1
+    )
+    half_size = min(max_half_size, max_psf_half_size)
 
     y0 = cy - half_size
     y1 = cy + half_size + 1
@@ -269,6 +278,9 @@ def run_pysersic_doublesersic(
     max_train=500,
     patience=75,
     num_round=2,
+    center_guess=None,
+    render_shape=None,
+    render_origin=(0, 0),
 ):
     """
     Fit a background-subtracted image with a pysersic doublesersic model.
@@ -295,6 +307,8 @@ def run_pysersic_doublesersic(
     fit_img = np.asarray(gal_img, dtype=np.float32)
     fit_mask = np.asarray(bad_pix, dtype=bool)
     fit_rms = np.asarray(gal_rms, dtype=np.float32)
+    if render_shape is None:
+        render_shape = fit_img.shape
     good_rms = fit_rms[~fit_mask & np.isfinite(fit_rms) & (fit_rms > 0)]
     if good_rms.size == 0:
         raise ValueError("No positive RMS values available for pysersic fitting.")
@@ -306,6 +320,7 @@ def run_pysersic_doublesersic(
     )
     fit_rms[fit_mask] = fill_rms
     fit_psf = crop_psf_for_fit(psf_img, fit_img.shape)
+    render_psf = crop_psf_for_fit(psf_img, render_shape)
     check_input_data(data=fit_img, rms=fit_rms, psf=fit_psf, mask=fit_mask)
 
     # SourceProperties uses photutils-derived source estimates. Suppress
@@ -313,7 +328,16 @@ def run_pysersic_doublesersic(
     # the original background-subtracted image.
     prior_img = np.clip(fit_img, 0.0, None)
     props = SourceProperties(image=prior_img, mask=fit_mask)
+    if center_guess is not None:
+        props.set_position_guess(center_guess)
     props.set_theta_guess(0.0)
+    print(
+        "pysersic SourceProperties:"
+        f" xc={props.xc_guess:.3f},"
+        f" yc={props.yc_guess:.3f},"
+        f" re={props.r_eff_guess:.3f} pix,"
+        f" flux={props.flux_guess:.3f}"
+    )
     prior = props.generate_prior("doublesersic", sky_type="none")
 
     inner_q_low, inner_q_high = np.sort(np.asarray(inner_q_bounds, dtype=np.float64))
@@ -344,14 +368,28 @@ def run_pysersic_doublesersic(
         prior.set_uniform_prior("ellip_2", 1.0 - outer_q_high, 1.0 - outer_q_low)
 
     ny, nx = fit_img.shape
-    xc_init = 0.5 * (nx - 1)
-    yc_init = 0.5 * (ny - 1)
+    xc_default = 0.5 * (nx - 1)
+    yc_default = 0.5 * (ny - 1)
+    if center_guess is None:
+        xc_init = xc_default
+        yc_init = yc_default
+    else:
+        xc_init = float(center_guess[0])
+        yc_init = float(center_guess[1])
+
+    r_eff_init = float(max(0.5, props.r_eff_guess))
     init_values = {
         "theta": 0.0,
         "ellip_1": 1.0 - inner_q_init,
         "ellip_2": 1.0 - outer_q_init,
         "xc": xc_init,
         "yc": yc_init,
+        "flux": float(max(1e-6, props.flux_guess)),
+        "f_1": 0.5,
+        "r_eff_1": float(max(0.5, r_eff_init / 1.5)),
+        "r_eff_2": float(max(0.5, r_eff_init * 1.5)),
+        "n_1": 4.0,
+        "n_2": 1.0,
     }
     print(
         "pysersic priors:"
@@ -365,7 +403,13 @@ def run_pysersic_doublesersic(
         f" q_inner={inner_q_init:.3f},"
         f" q_outer={outer_q_init:.3f},"
         f" xc={xc_init:.3f},"
-        f" yc={yc_init:.3f}"
+        f" yc={yc_init:.3f},"
+        f" flux={init_values['flux']:.3f},"
+        f" f1={init_values['f_1']:.3f},"
+        f" re1={init_values['r_eff_1']:.3f},"
+        f" re2={init_values['r_eff_2']:.3f},"
+        f" n1={init_values['n_1']:.3f},"
+        f" n2={init_values['n_2']:.3f}"
     )
 
     fitter = FitSingle(
@@ -393,22 +437,21 @@ def run_pysersic_doublesersic(
         for key, value in map_params.items()
         if key != "model"
     }
+    x_origin, y_origin = render_origin
+    fit_params["xc"] = float(fit_params["xc"]) + float(x_origin)
+    fit_params["yc"] = float(fit_params["yc"]) + float(y_origin)
 
-    if "model" in map_params:
-        conv_model_img = np.asarray(map_params["model"], dtype=np.float64)
-    else:
-        conv_renderer = HybridRenderer(
-            fit_img.shape,
-            jnp.array(fit_psf.astype(np.float32)),
-        )
-        conv_model_img = np.asarray(
-            conv_renderer.render_source(fit_params, profile_type="doublesersic"),
-            dtype=np.float64,
-        )
-
+    conv_renderer = HybridRenderer(
+        render_shape,
+        jnp.array(render_psf.astype(np.float32)),
+    )
+    conv_model_img = np.asarray(
+        conv_renderer.render_source(fit_params, profile_type="doublesersic"),
+        dtype=np.float64,
+    )
     intrinsic_renderer = HybridRenderer(
-        fit_img.shape,
-        jnp.array(make_delta_psf(fit_psf)),
+        render_shape,
+        jnp.array(make_delta_psf(render_psf)),
     )
     intrinsic_model_img = np.asarray(
         intrinsic_renderer.render_source(fit_params, profile_type="doublesersic"),
@@ -604,10 +647,30 @@ def deconvolve_image(
     if method == "pysersic":
         if axis_ratio_bounds is None:
             raise ValueError("pysersic requires `axis_ratio_bounds` to be provided.")
+        fit_img = gal_img
+        fit_rms = gal_rms
+        fit_bad_pix = bad_pix.copy()
+        fit_origin_x = 0
+        fit_origin_y = 0
+        if bound_pix_rad is not None:
+            fit_half_size = float(bound_pix_rad)
+            y_slice, x_slice = get_center_crop_slices(gal_img.shape, fit_half_size)
+            fit_origin_y = y_slice.start
+            fit_origin_x = x_slice.start
+            fit_img = gal_img[y_slice, x_slice]
+            fit_rms = gal_rms[y_slice, x_slice]
+            fit_bad_pix = bad_pix[y_slice, x_slice].copy()
+            print(
+                "Restricting pysersic fit to the central cutout:"
+                f" half-size={fit_half_size:.1f} pixels,"
+                f" cutout shape={fit_img.shape},"
+                f" origin=({fit_origin_x}, {fit_origin_y}),"
+                f" unmasked fit pixels={(~fit_bad_pix).sum()}"
+            )
         intrinsic_model_img, conv_model_img, fit_params = run_pysersic_doublesersic(
-            gal_img,
-            gal_rms,
-            bad_pix,
+            fit_img,
+            fit_rms,
+            fit_bad_pix,
             psf_img,
             inner_q_bounds=axis_ratio_bounds,
             inner_q_init=axis_ratio_init,
@@ -616,6 +679,9 @@ def deconvolve_image(
             max_train=pysersic_max_train,
             patience=pysersic_patience,
             num_round=pysersic_num_round,
+            center_guess=(0.5 * (fit_img.shape[1] - 1), 0.5 * (fit_img.shape[0] - 1)),
+            render_shape=gal_img.shape,
+            render_origin=(fit_origin_x, fit_origin_y),
         )
         resid = gal_img - conv_model_img
         deconv_img = intrinsic_model_img + resid
@@ -758,9 +824,9 @@ if __name__ == "__main__":
     if m1 >= 9.0 and m2 <= 10.0:
         bound_pix_rad = 100 / pixel_to_kpc
     if m1 >= 10.0 and m2 <= 11.0:
-        bound_pix_rad = 200 / pixel_to_kpc
+        bound_pix_rad = 300 / pixel_to_kpc
     if m1 >= 11.0 and m2 <= 12.0:
-        bound_pix_rad = 500 / pixel_to_kpc
+        bound_pix_rad = 600 / pixel_to_kpc
 
     # load PSF MGE and image
     psf_img_path = psf_dir / f"stack_1000_psf_{filter}_0.1.fits"

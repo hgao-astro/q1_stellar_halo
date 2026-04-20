@@ -39,8 +39,8 @@ mass_bins=("9.0 9.5" "9.5 10.0" "10.0 10.5" "10.5 11.0" "11.0 11.5" "11.5 12.0")
 q_bins=("0.0 0.5" "0.5 1.0" "0.0 1.0")
 filters=("I" "Y" "J" "H")
 
-# Initialize (mass, q) bin index counter (accumulates across all z bins)
-mq_bin_index=0
+# Initialize bin index counter for staggered starts across all submissions.
+bin_index=0
 
 # Loop over z bins
 for z1 in $(seq $z_min $dz "$(echo "$z_max - $dz" | bc)"); do
@@ -59,14 +59,12 @@ for z1 in $(seq $z_min $dz "$(echo "$z_max - $dz" | bc)"); do
         # Loop over axis ratio bins
         for q_bin in "${q_bins[@]}"; do
             read -r q1 q2 <<< "$q_bin"
-
-            # Calculate delay in minutes (2 minutes per mass/q bin)
-            delay_minutes=$((mq_bin_index * 2))
+            delay_seconds=$((bin_index * 20))
 
             # Loop over filters
             for filter in "${filters[@]}"; do
                 sbatch_args=(
-                    --begin=now+${delay_minutes}minutes
+                    --begin=now+${delay_seconds}seconds
                     --mem=${memory}g
                 )
                 if [[ "$deconv_method" == "pysersic" ]]; then
@@ -78,14 +76,12 @@ for z1 in $(seq $z_min $dz "$(echo "$z_max - $dz" | bc)"); do
                     "z=[${z1},${z2}) logM=[${m1},${m2}) q=[${q1},${q2})" \
                     "filter=${filter} mem=${memory}GB" \
                     "cpus=$([[ "$deconv_method" == "pysersic" ]] && echo 5 || echo 1)" \
-                    "(delay: ${delay_minutes} min)"
+                    "(delay: ${delay_seconds} s)"
                 sbatch "${sbatch_args[@]}" "$deconv_script" \
                     "$z1" "$z2" "$m1" "$m2" "$q1" "$q2" "$filter" \
                     --deconv-method "$deconv_method"
             done
-
-            # Increment bin index for next (mass, q) bin
-            mq_bin_index=$((mq_bin_index + 1))
+            bin_index=$((bin_index + 1))
         done
     done
 done
