@@ -45,18 +45,16 @@ memory_for_job() {
 
     case "$method" in
         imcascade)
-            # imcascade smooth-q fits on a central crop, then renders the
-            # convolved 10x20 Gaussian model on the full stack. The full-render
-            # stack is the dominant memory term and scales with image area:
-            # z=[0.2,0.3): 1653^2 -> ~8.1 GiB raw render stack -> request 16 GB
-            # z=[0.3,0.4): 1309^2 -> ~5.1 GiB raw render stack -> request 12 GB
-            # z=[0.4,0.5): 1123^2 -> ~3.7 GiB raw render stack -> request 10 GB
-            # z>=0.5: <=1010^2 -> <=3.1 GiB raw render stack -> request 8 GB
+            # Measured from imcascade jobs 6674034-6674465 using MaxRSS, with
+            # roughly >=20% headroom: max RSS by z was
+            # 10.15, 6.83, 5.44, 4.69, 6.08, 3.90 GB.
             case "$z1" in
-                0.2) echo 16 ;;
-                0.3) echo 12 ;;
-                0.4) echo 10 ;;
-                *) echo 8 ;;
+                0.2) echo 13 ;;
+                0.3) echo 9 ;;
+                0.4) echo 8 ;;
+                0.5) echo 8 ;;
+                0.6) echo 8 ;;
+                *) echo 6 ;;
             esac
             ;;
         pysersic)

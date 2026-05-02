@@ -22,6 +22,7 @@ from astropy import units as u
 from astropy.cosmology import FlatLambdaCDM
 from astropy.io import fits
 from imcascade import Fitter
+from photutils.profiles import CurveOfGrowth
 from skimage.restoration import richardson_lucy, unsupervised_wiener
 
 cosmo = FlatLambdaCDM(
@@ -229,36 +230,54 @@ def write_deconvolved_image(gal_img_path, method, img, psf_fwhm_est, extra_heade
     )
 
 
-def estimate_galaxy_parameters(gal_img_path, pixel_scale=0.3, bound_pix_rad=None):
-    """Estimate galaxy flux and effective radius for imcascade initialization."""
-    gal_img_ = galsim.fits.read(
-        str(gal_img_path)
-    )  # galsim is not compatible with pathlib!
-    if bound_pix_rad is not None:
-        xmid = (gal_img_.xmin + gal_img_.xmax) / 2
-        ymid = (gal_img_.ymin + gal_img_.ymax) / 2
-        rad = bound_pix_rad
-        bounds = galsim.BoundsI(
-            round(xmid - rad),
-            round(xmid + rad),
-            round(ymid - rad),
-            round(ymid + rad),
-        )
-        gal_img_ = gal_img_.subImage(bounds)
-    gal_img_ = galsim.InterpolatedImage(
-        gal_img_,
-        scale=pixel_scale,
-        depixelize=False,
-        normalization="flux",
-    )
-    gal_flux_est = gal_img_.flux
-    gal_re_est = gal_img_.calculateHLR()
-    gal_re_est_pix = gal_re_est / pixel_scale
+def estimate_galaxy_parameters_from_cog(gal_img, bad_pix, pixel_scale=0.3):
+    """Estimate signed flux and half-light radius from a circular COG."""
+    gal_img = np.asarray(gal_img, dtype=np.float64)
+    bad_pix = np.asarray(bad_pix, dtype=bool) | ~np.isfinite(gal_img)
+    valid = ~bad_pix
+    if not np.any(valid):
+        raise ValueError("No valid pixels available for COG parameter estimation.")
+
+    gal_flux_est = float(np.nansum(gal_img[valid]))
     if gal_flux_est <= 0:
         raise ValueError("Estimated galaxy flux is non-positive.")
-    print(f"Estimated galaxy flux: {gal_flux_est} within {bound_pix_rad} pixels")
+
+    ny, nx = gal_img.shape
+    max_radius = min(ny, nx) // 2
+    if max_radius < 2:
+        raise ValueError("Image is too small for COG parameter estimation.")
+
+    xycen = (0.5 * (nx - 1), 0.5 * (ny - 1))
+    radii = np.arange(1, max_radius + 1, dtype=np.float64)
+    cog = CurveOfGrowth(gal_img, xycen, radii, mask=bad_pix, method="exact")
+    profile = np.asarray(cog.profile, dtype=np.float64)
+    max_profile = float(np.nanmax(profile))
+    if not np.isfinite(max_profile) or max_profile <= 0:
+        raise ValueError("COG profile has no positive enclosed flux.")
+
+    cog.normalize(method="max")
+    gal_re_est_pix = float(np.asarray(cog.calc_radius_at_ee(0.5)).item())
+    if not np.isfinite(gal_re_est_pix) or gal_re_est_pix <= 0:
+        raise ValueError("Unable to estimate a finite COG half-light radius.")
+
+    gal_re_est = gal_re_est_pix * pixel_scale
+    return gal_flux_est, gal_re_est, gal_re_est_pix
+
+
+def estimate_galaxy_parameters(gal_img, bad_pix, pixel_scale=0.3, bound_pix_rad=None):
+    """Estimate galaxy flux and effective radius for model initialization."""
+    if bound_pix_rad is not None:
+        y_slice, x_slice = get_center_crop_slices(gal_img.shape, bound_pix_rad)
+        gal_img = gal_img[y_slice, x_slice]
+        bad_pix = bad_pix[y_slice, x_slice]
+    gal_flux_est, gal_re_est, gal_re_est_pix = estimate_galaxy_parameters_from_cog(
+        gal_img,
+        bad_pix,
+        pixel_scale=pixel_scale,
+    )
+    print(f"Estimated COG galaxy flux: {gal_flux_est} within {bound_pix_rad} pixels")
     print(
-        "Estimated galaxy effective radius:"
+        "Estimated COG galaxy effective radius:"
         f" {gal_re_est} arcsec ({gal_re_est_pix} pixels)"
     )
     return gal_flux_est, gal_re_est, gal_re_est_pix
@@ -331,12 +350,19 @@ def run_pysersic_doublesersic(
     if center_guess is not None:
         props.set_position_guess(center_guess)
     props.set_theta_guess(0.0)
+    cog_flux_guess, _, cog_r_eff_guess = estimate_galaxy_parameters_from_cog(
+        fit_img,
+        fit_mask,
+        pixel_scale=1.0,
+    )
+    props.set_r_eff_guess(cog_r_eff_guess)
     print(
-        "pysersic SourceProperties:"
+        "pysersic SourceProperties/COG:"
         f" xc={props.xc_guess:.3f},"
         f" yc={props.yc_guess:.3f},"
         f" re={props.r_eff_guess:.3f} pix,"
-        f" flux={props.flux_guess:.3f}"
+        f" flux={props.flux_guess:.3f},"
+        f" COG flux={cog_flux_guess:.3f}"
     )
     prior = props.generate_prior("doublesersic", sky_type="none")
 
@@ -561,8 +587,9 @@ def deconvolve_image(
                 f" origin=({fit_origin_x}, {fit_origin_y}),"
                 f" unmasked fit pixels={(~fit_bad_pix).sum()}"
             )
-        gal_flux_est, gal_re_est, gal_re_est_pix = estimate_galaxy_parameters(
-            gal_img_path,
+        gal_flux_est, _, gal_re_est_pix = estimate_galaxy_parameters(
+            gal_img,
+            bad_pix,
             pixel_scale=pixel_scale,
             bound_pix_rad=bound_pix_rad,
         )
@@ -585,7 +612,7 @@ def deconvolve_image(
         num_components = 10
         sig = np.geomspace(
             psf_fwhm_est / pixel_scale / 2,
-            gal_re_est / pixel_scale * 20,
+            gal_re_est_pix * 20,
             num=num_components,
         )
         q_logsig_mid_init = float(
