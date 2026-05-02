@@ -39,6 +39,44 @@ mass_bins=("9.0 9.5" "9.5 10.0" "10.0 10.5" "10.5 11.0" "11.0 11.5" "11.5 12.0")
 q_bins=("0.0 0.5" "0.5 1.0" "0.0 1.0")
 filters=("I" "Y" "J" "H")
 
+memory_for_job() {
+    local method="$1"
+    local z1="$2"
+
+    case "$method" in
+        imcascade)
+            # imcascade smooth-q fits on a central crop, then renders the
+            # convolved 10x20 Gaussian model on the full stack. The full-render
+            # stack is the dominant memory term and scales with image area:
+            # z=[0.2,0.3): 1653^2 -> ~8.1 GiB raw render stack -> request 16 GB
+            # z=[0.3,0.4): 1309^2 -> ~5.1 GiB raw render stack -> request 12 GB
+            # z=[0.4,0.5): 1123^2 -> ~3.7 GiB raw render stack -> request 10 GB
+            # z>=0.5: <=1010^2 -> <=3.1 GiB raw render stack -> request 8 GB
+            case "$z1" in
+                0.2) echo 16 ;;
+                0.3) echo 12 ;;
+                0.4) echo 10 ;;
+                *) echo 8 ;;
+            esac
+            ;;
+        pysersic)
+            # pysersic fits on the central crop and only renders full-frame
+            # products after optimization, so it can use a lighter z-dependent
+            # table than imcascade.
+            case "$z1" in
+                0.2) echo 10 ;;
+                0.3|0.4) echo 8 ;;
+                *) echo 6 ;;
+            esac
+            ;;
+        *)
+            # Wiener/RL operate directly on the image/PSF arrays and do not need
+            # the large imcascade Gaussian render stack.
+            echo 5
+            ;;
+    esac
+}
+
 # Initialize bin index counter for staggered starts across all submissions.
 bin_index=0
 
@@ -48,13 +86,7 @@ for z1 in $(seq $z_min $dz "$(echo "$z_max - $dz" | bc)"); do
     # Loop over mass bins
     for mass_bin in "${mass_bins[@]}"; do
         read -r m1 m2 <<< "$mass_bin"
-
-        # Calculate memory: 10GB at z=0.2, decreasing linearly to 5GB at z=0.7.
-        # For z > 0.7, keep the request at the 5GB floor.
-        memory=$(printf "%.0f" "$(echo "10 - 10 * ($z1 - 0.2)" | bc)")
-        if (( memory < 5 )); then
-            memory=5
-        fi
+        memory=$(memory_for_job "$deconv_method" "$z1")
 
         # Loop over axis ratio bins
         for q_bin in "${q_bins[@]}"; do

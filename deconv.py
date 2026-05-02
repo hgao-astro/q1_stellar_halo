@@ -496,10 +496,10 @@ def deconvolve_image(
     method : {"imcascade", "wiener", "richardson_lucy", "pysersic"}
         The single deconvolution method to apply.
     axis_ratio_init : float
-        Initial axis ratio used by imcascade and as the inner q initialization for
-        pysersic.
+        Initial inner axis ratio used by imcascade smooth-q and pysersic.
     axis_ratio_bounds : tuple[float, float], optional
-        Axis-ratio range from the input bin, used as the inner q prior for pysersic.
+        Axis-ratio range from the input bin, used as the inner q bound for
+        imcascade smooth-q and pysersic.
     pixel_scale : float, optional
         Pixel scale in arcsec/pixel. Default is 0.3.
     bound_pix_rad : float, optional
@@ -541,41 +541,93 @@ def deconvolve_image(
         raise ValueError(f"No valid pixels available for fitting in {gal_img_path}.")
 
     if method == "imcascade":
+        fit_img = gal_img
+        fit_weight = weight
+        fit_bad_pix = bad_pix.copy()
+        fit_origin_x = 0
+        fit_origin_y = 0
+        if bound_pix_rad is not None:
+            fit_half_size = float(bound_pix_rad)
+            y_slice, x_slice = get_center_crop_slices(gal_img.shape, fit_half_size)
+            fit_origin_y = y_slice.start
+            fit_origin_x = x_slice.start
+            fit_img = gal_img[y_slice, x_slice]
+            fit_weight = weight[y_slice, x_slice]
+            fit_bad_pix = bad_pix[y_slice, x_slice].copy()
+            print(
+                "Restricting imcascade fit to the central cutout:"
+                f" half-size={fit_half_size:.1f} pixels,"
+                f" cutout shape={fit_img.shape},"
+                f" origin=({fit_origin_x}, {fit_origin_y}),"
+                f" unmasked fit pixels={(~fit_bad_pix).sum()}"
+            )
         gal_flux_est, gal_re_est, gal_re_est_pix = estimate_galaxy_parameters(
             gal_img_path,
             pixel_scale=pixel_scale,
             bound_pix_rad=bound_pix_rad,
         )
+        if axis_ratio_bounds is None:
+            inner_q_low, inner_q_high = 0.1, 1.0
+        else:
+            inner_q_low, inner_q_high = np.sort(
+                np.asarray(axis_ratio_bounds, dtype=np.float64)
+            )
+            inner_q_low = float(np.clip(inner_q_low, 0.1, 1.0))
+            inner_q_high = float(np.clip(inner_q_high, inner_q_low, 1.0))
+            if inner_q_high <= inner_q_low:
+                inner_q_low = max(0.1, inner_q_low - 1e-3)
+                inner_q_high = min(1.0, inner_q_low + 1e-3)
+        inner_q_init = float(np.clip(axis_ratio_init, inner_q_low, inner_q_high))
+        outer_q_init = 0.8
+        outer_q_bounds = (0.2, 1.0)
+
         # imcascade deconvolution
+        num_components = 10
         sig = np.geomspace(
-            psf_fwhm_est / pixel_scale / 2, gal_re_est / pixel_scale * 20, num=10
+            psf_fwhm_est / pixel_scale / 2,
+            gal_re_est / pixel_scale * 20,
+            num=num_components,
         )
+        q_logsig_mid_init = float(
+            np.clip(np.log10(gal_re_est_pix), np.log10(sig).min(), np.log10(sig).max())
+        )
+        x0_fit = 0.5 * (fit_img.shape[1] - 1)
+        y0_fit = 0.5 * (fit_img.shape[0] - 1)
         fitter = Fitter(
-            gal_img,
+            fit_img,
             sig,
             sigma_psf,
             norm_psf,
-            weight=weight,
-            mask=bad_pix,
+            weight=fit_weight,
+            mask=fit_bad_pix,
             sky_model=False,
             init_dict={
+                "x0": y0_fit,
+                "y0": x0_fit,
                 # imcascade expects `re` in the same units as `sig`, i.e. pixels.
                 "re": gal_re_est_pix,
                 "flux": gal_flux_est,
-                "q": axis_ratio_init,
+                "q_in": inner_q_init,
+                "q_out": outer_q_init,
+                "q_logsig_mid": q_logsig_mid_init,
                 # imcascade's internal +x is NumPy axis 0; the displayed horizontal
                 # image axis is therefore its +y. phi=pi/2 puts the major axis along
                 # the displayed horizontal axis for the untransposed FITS image.
                 "phi": np.pi / 2,
             },
             bounds_dict={
+                "x0": (y0_fit - 5, y0_fit + 5),
+                "y0": (x0_fit - 5, x0_fit + 5),
                 "phi": (np.pi / 2 - np.deg2rad(10), np.pi / 2 + np.deg2rad(10)),
-                "q": (0.2, 1.0),
+                "q_in": (inner_q_low, inner_q_high),
+                "q_out": outer_q_bounds,
             },
+            q_mode="smooth",
         )
         min_res = fitter.run_ls_min()
-        best_fit_q = min_res[2]
-        best_fit_phi = min_res[3]
+        best_fit_q_params = min_res[fitter.q_slice]
+        best_fit_q_arr = fitter._expand_q_params(best_fit_q_params)
+        best_fit_phi = min_res[fitter.idx_phi]
         best_fit_phi_display = (best_fit_phi - np.pi / 2) % np.pi
         best_fit_pa_img_deg = np.degrees(best_fit_phi_display)
         best_fit_pa_xaxis_deg = min(best_fit_pa_img_deg, 180.0 - best_fit_pa_img_deg)
@@ -585,19 +637,80 @@ def deconvolve_image(
             )
         print(
             "imcascade best-fit shape:"
-            f" q={best_fit_q:.6f},"
+            f" q_in={best_fit_q_params[0]:.6f},"
+            f" q_out={best_fit_q_params[1]:.6f},"
+            f" q_logsig_mid={best_fit_q_params[2]:.6f},"
+            f" q_range=[{np.min(best_fit_q_arr):.6f}, {np.max(best_fit_q_arr):.6f}],"
             f" PA={best_fit_pa_xaxis_deg:.3f} deg from x-axis"
         )
-        fitter.save_results(
+        full_param = np.array(fitter.min_param, copy=True)
+        full_param[fitter.idx_x0] += fit_origin_y
+        full_param[fitter.idx_y0] += fit_origin_x
+
+        full_conv_modeler = Fitter(
+            gal_img,
+            sig,
+            sigma_psf,
+            norm_psf,
+            weight=weight,
+            mask=bad_pix,
+            sky_model=False,
+            init_dict={
+                "x0": full_param[fitter.idx_x0],
+                "y0": full_param[fitter.idx_y0],
+                "re": gal_re_est_pix,
+                "flux": gal_flux_est,
+                "q_in": best_fit_q_params[0],
+                "q_out": best_fit_q_params[1],
+                "q_logsig_mid": best_fit_q_params[2],
+                "phi": best_fit_phi,
+            },
+            bounds_dict={
+                "phi": (np.pi / 2 - np.deg2rad(10), np.pi / 2 + np.deg2rad(10)),
+                "q_in": (inner_q_low, inner_q_high),
+                "q_out": outer_q_bounds,
+            },
+            q_mode="smooth",
+            q_smooth_width=fitter.q_smooth_width,
+            verbose=False,
+        )
+        full_conv_modeler.min_param = full_param.copy()
+        full_conv_modeler.save_results(
             gal_img_path.with_suffix(".asdf").with_stem(
                 gal_img_path.stem + "_deconv_imcascade"
             )
         )
+        full_intrinsic_modeler = Fitter(
+            gal_img,
+            sig,
+            None,
+            None,
+            weight=weight,
+            mask=bad_pix,
+            sky_model=False,
+            init_dict={
+                "x0": full_param[fitter.idx_x0],
+                "y0": full_param[fitter.idx_y0],
+                "re": gal_re_est_pix,
+                "flux": gal_flux_est,
+                "q_in": best_fit_q_params[0],
+                "q_out": best_fit_q_params[1],
+                "q_logsig_mid": best_fit_q_params[2],
+                "phi": best_fit_phi,
+            },
+            bounds_dict={
+                "phi": (np.pi / 2 - np.deg2rad(10), np.pi / 2 + np.deg2rad(10)),
+                "q_in": (inner_q_low, inner_q_high),
+                "q_out": outer_q_bounds,
+            },
+            q_mode="smooth",
+            q_smooth_width=fitter.q_smooth_width,
+            verbose=False,
+        )
         # add back residuals to the model image
-        conv_model_img = fitter.make_model(fitter.min_param)
+        conv_model_img = full_conv_modeler.make_model(full_param)
         resid = gal_img - conv_model_img
-        fitter.has_psf = False
-        deconv_img = fitter.make_model(fitter.min_param) + resid
+        deconv_img = full_intrinsic_modeler.make_model(full_param) + resid
         deconv_img[bad_pix] = np.nan
         write_deconvolved_image(
             gal_img_path,
@@ -605,7 +718,14 @@ def deconvolve_image(
             deconv_img,
             psf_fwhm_est,
             extra_header={
-                "IC_Q": (best_fit_q, "imcascade best-fit axis ratio"),
+                "ICQMODE": ("smooth", "imcascade q parameterization"),
+                "ICNCOMP": (num_components, "imcascade Gaussian components"),
+                "ICQIN": (best_fit_q_params[0], "imcascade inner axis ratio"),
+                "ICQOUT": (best_fit_q_params[1], "imcascade outer axis ratio"),
+                "ICQMID": (best_fit_q_params[2], "imcascade q midpoint log10 sigma"),
+                "ICQWID": (fitter.q_smooth_width, "imcascade q transition width"),
+                "ICQMIN": (np.min(best_fit_q_arr), "minimum expanded q"),
+                "ICQMAX": (np.max(best_fit_q_arr), "maximum expanded q"),
                 "IC_PA": (best_fit_pa_xaxis_deg, "imcascade PA in deg from x-axis"),
             },
         )
