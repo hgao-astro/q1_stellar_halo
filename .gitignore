@@ -2,7 +2,15 @@
 *.fits
 *.asdf
 *.png
-hlr.txt
+*.pdf
+*.csv
+*.txt
+*.json
+
+# logs
+*.err
+*.out
+*.log
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
