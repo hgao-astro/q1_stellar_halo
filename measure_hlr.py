@@ -37,7 +37,7 @@ stack_dir = Path("~/Q1_gal_stacks_rot").expanduser()
 pixel_scale = 0.3
 ncores = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
 REFERENCE_FILTER = "I"
-REFERENCE_IMAGE_KIND = "pysersic"
+REFERENCE_IMAGE_KIND = "imcascade"
 REF_WAV = {
     "I": 7180.870626325479,
     "Y": 10812.431007172765,
