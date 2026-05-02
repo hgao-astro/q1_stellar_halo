@@ -45,16 +45,16 @@ memory_for_job() {
 
     case "$method" in
         imcascade)
-            # Measured from imcascade jobs 6674034-6674465 using MaxRSS, with
-            # roughly >=20% headroom: max RSS by z was
-            # 10.15, 6.83, 5.44, 4.69, 6.08, 3.90 GB.
+            # Measured from imcascade jobs 6677535-6677966 after the COG-HLR
+            # update. The z=[0.7,0.8) jobs all OOMed at 6 GB, so use 10 GB
+            # there instead of the earlier underestimated request.
             case "$z1" in
                 0.2) echo 13 ;;
                 0.3) echo 9 ;;
                 0.4) echo 8 ;;
                 0.5) echo 8 ;;
                 0.6) echo 8 ;;
-                *) echo 6 ;;
+                *) echo 8 ;;
             esac
             ;;
         pysersic)
