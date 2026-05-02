@@ -1,6 +1,6 @@
 #!/gpfs01/home/ppzhg/.conda/envs/icl-py313/bin/python3
 # fmt: off
-#SBATCH --partition=shortq
+#SBATCH --partition=shortq,defq
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=30
@@ -13,6 +13,7 @@
 
 import multiprocessing as mp
 import os
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,7 +23,6 @@ import numpy as np
 from astropy.cosmology import FlatLambdaCDM
 from astropy.io import fits
 from astropy.table import Table
-from imcascade import ImcascadeResults
 from photutils.profiles import CurveOfGrowth
 from scipy.interpolate import PchipInterpolator
 
@@ -35,8 +35,17 @@ cosmo = FlatLambdaCDM(
 
 stack_dir = Path("~/Q1_gal_stacks_rot").expanduser()
 pixel_scale = 0.3
-mag_zpt = 23.9
 ncores = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
+REFERENCE_FILTER = "I"
+REFERENCE_IMAGE_KIND = "pysersic"
+REF_WAV = {
+    "I": 7180.870626325479,
+    "Y": 10812.431007172765,
+    "J": 13669.531078314576,
+    "H": 17707.85463376991,
+}
+TARGET_REST_WAV = REF_WAV["I"]
+RESTFRAME_FILTER_LABEL = "I_rest"
 
 
 @dataclass
@@ -47,102 +56,188 @@ class SBP:
     radius_kpc: np.ndarray
     sbp: np.ndarray
     sbp_err: np.ndarray
+    axis_ratio: np.ndarray
 
 
-def intens_to_sb(intens, pixel_scale=0.3, mag_zpt=23.9):
-    return mag_zpt - 2.5 * np.log10(intens / pixel_scale**2)
+def midpoint(lower, upper, ndigits=6):
+    """Return a rounded bin center to suppress floating-point display artifacts."""
+    return round(0.5 * (float(lower) + float(upper)), ndigits)
 
 
-def get_sbps(z1, z2, m1, m2, q1, q2, filter, gal_type, nsigma=3):
+def build_sbp_path(
+    z1,
+    z2,
+    m1,
+    m2,
+    q1,
+    q2,
+    filter_name,
+    gal_type,
+    use_reference_isophotes=False,
+):
+    path = (
+        stack_dir / f"sbps_{gal_type}_{filter_name}_{z1}_{z2}_{m1}_{m2}_{q1}_{q2}.asdf"
+    )
+    if use_reference_isophotes and filter_name != REFERENCE_FILTER:
+        return path.with_stem(
+            path.stem + f"_refiso-{REFERENCE_FILTER}-{REFERENCE_IMAGE_KIND}"
+        )
+    return path
+
+
+def build_deconv_img_path(z1, z2, m1, m2, q1, q2, filter_name, gal_type):
+    return (
+        stack_dir
+        / f"stack_{gal_type}_{filter_name}_{z1}_{z2}_{m1}_{m2}_{q1}_{q2}_subbkg_deconv_pysersic.fits"
+    )
+
+
+def build_wiener_img_path(z1, z2, m1, m2, q1, q2, filter_name, gal_type):
+    return (
+        stack_dir
+        / f"stack_{gal_type}_{filter_name}_{z1}_{z2}_{m1}_{m2}_{q1}_{q2}_subbkg_deconv_wiener.fits"
+    )
+
+
+def get_sbps(
+    z1,
+    z2,
+    m1,
+    m2,
+    q1,
+    q2,
+    filter_name,
+    gal_type,
+    nsigma=3,
+    use_reference_isophotes=False,
+):
     """
     Compute surface brightness profiles for original data and deconvolved images.
     """
-    asdf_path = (
-        stack_dir / f"sbps_{gal_type}_{filter}_{z1}_{z2}_{m1}_{m2}_{q1}_{q2}.asdf"
+    asdf_path = build_sbp_path(
+        z1,
+        z2,
+        m1,
+        m2,
+        q1,
+        q2,
+        filter_name,
+        gal_type,
+        use_reference_isophotes=use_reference_isophotes,
     )
-    if asdf_path.exists():
-        sbps_dict = asdf.open(asdf_path)
-    else:
+    if not asdf_path.exists():
         print(f"No existing sbp file found at {asdf_path}.")
         return None, None, None
-    pixel_to_kpc = sbps_dict.tree["pixel_to_kpc"]
-    sbp_gal_table = sbps_dict.tree["gal"]
-    sbp_sky_tables = sbps_dict.tree["sky"]
-    sbp_bs_tables = sbps_dict.tree["bootstrap"]
-    sbp_gal_deconv_imcascade_table = sbps_dict.tree["gal deconv imcascade"]
-    sbp_gal_deconv_wiener_table = sbps_dict.tree["gal deconv wiener"]
-    sma = sbp_gal_table["sma"]
-    intens_gal = sbp_gal_table["intens"]
-    intens_gal_deconv_imcascade = sbp_gal_deconv_imcascade_table["intens"]
-    intens_gal_deconv_wiener = sbp_gal_deconv_wiener_table["intens"]
-    # combine bootstrap error and background error
-    bkg_err = (
-        np.nanstd([tab["intens"] for tab in sbp_sky_tables], axis=0)
-        if len(sbp_sky_tables) > 0
-        else np.zeros_like(intens_gal)
-    )
-    bs_err = (
-        np.nanstd([tab["intens"] for tab in sbp_bs_tables], axis=0)
-        if len(sbp_bs_tables) > 0
-        else np.zeros_like(intens_gal)
-    )
-    comb_err = np.fmax(bkg_err, bs_err)
+
+    with asdf.open(asdf_path) as sbps_dict:
+        pixel_to_kpc = float(sbps_dict.tree["pixel_to_kpc"])
+        sbp_gal_table = sbps_dict.tree["gal"]
+        sbp_sky_tables = sbps_dict.tree["sky"]
+        sbp_bs_tables = sbps_dict.tree["bootstrap"]
+        sbp_gal_deconv_pysersic_table = sbps_dict.tree["gal deconv pysersic"]
+        sbp_gal_deconv_wiener_table = sbps_dict.tree["gal deconv wiener"]
+
+        sma = np.asarray(sbp_gal_table["sma"], dtype=np.float64)
+        intens_gal = np.asarray(sbp_gal_table["intens"], dtype=np.float64)
+        q_gal = np.clip(
+            1.0 - np.asarray(sbp_gal_table["ellipticity"], dtype=np.float64),
+            0.0,
+            1.0,
+        )
+        intens_gal_deconv_pysersic = np.asarray(
+            sbp_gal_deconv_pysersic_table["intens"], dtype=np.float64
+        )
+        q_gal_deconv_pysersic = np.clip(
+            1.0
+            - np.asarray(
+                sbp_gal_deconv_pysersic_table["ellipticity"], dtype=np.float64
+            ),
+            0.0,
+            1.0,
+        )
+        intens_gal_deconv_wiener = np.asarray(
+            sbp_gal_deconv_wiener_table["intens"], dtype=np.float64
+        )
+        q_gal_deconv_wiener = np.clip(
+            1.0
+            - np.asarray(sbp_gal_deconv_wiener_table["ellipticity"], dtype=np.float64),
+            0.0,
+            1.0,
+        )
+        # combine bootstrap error and background error
+        bkg_err = (
+            np.nanstd([tab["intens"] for tab in sbp_sky_tables], axis=0)
+            if len(sbp_sky_tables) > 0
+            else np.zeros_like(intens_gal)
+        )
+        bs_err = (
+            np.nanstd([tab["intens"] for tab in sbp_bs_tables], axis=0)
+            if len(sbp_bs_tables) > 0
+            else np.zeros_like(intens_gal)
+        )
+        comb_err = np.fmax(bkg_err, bs_err)
 
     # truncate sbps at >=3*combined_err
     # find the first point dropping below 3*combined_err
     try:
         rad_max_ind = np.where(
             (intens_gal < nsigma * comb_err)
-            | (intens_gal_deconv_imcascade < nsigma * comb_err)
-            # | (intens_gal_deconv_wiener < nsigma * comb_err)
+            | (intens_gal_deconv_pysersic < nsigma * comb_err)
+            | (intens_gal_deconv_wiener < nsigma * comb_err)
         )[0][0]
     except IndexError:
         print(
-            f"All data points are above threshold in {filter}-band, {z1}-{z2}, {m1}-{m2}."
+            f"All data points are above threshold in {filter_name}-band, {z1}-{z2}, {m1}-{m2}."
         )
         rad_max_ind = len(sma)
     sma = sma[:rad_max_ind]
     sma_kpc = sma * pixel_to_kpc
     comb_err = comb_err[:rad_max_ind]
     intens_gal = intens_gal[:rad_max_ind]
-    intens_gal_deconv_imcascade = intens_gal_deconv_imcascade[:rad_max_ind]
+    q_gal = q_gal[:rad_max_ind]
+    intens_gal_deconv_pysersic = intens_gal_deconv_pysersic[:rad_max_ind]
+    q_gal_deconv_pysersic = q_gal_deconv_pysersic[:rad_max_ind]
     intens_gal_deconv_wiener = intens_gal_deconv_wiener[:rad_max_ind]
+    q_gal_deconv_wiener = q_gal_deconv_wiener[:rad_max_ind]
 
-    # compute imcascade mge profile (free of pixel response, no residuals added back)
-    # res = ImcascadeResults(str(imcas_res_path))
-    # sbp = res.calc_sbp(rad_for_imcascade)
-
-    # Return organized results using dataclass
     obs_res = SBP(
         radius=sma,
         radius_kpc=sma_kpc,
         sbp=intens_gal,
         sbp_err=comb_err,
+        axis_ratio=q_gal,
+    )
+    pysersic_res = SBP(
+        radius=sma,
+        radius_kpc=sma_kpc,
+        sbp=intens_gal_deconv_pysersic,
+        sbp_err=comb_err,
+        axis_ratio=q_gal_deconv_pysersic,
     )
     wiener_res = SBP(
         radius=sma,
         radius_kpc=sma_kpc,
         sbp=intens_gal_deconv_wiener,
         sbp_err=comb_err,
+        axis_ratio=q_gal_deconv_wiener,
     )
-    imcascade_res = SBP(
-        radius=sma,
-        radius_kpc=sma_kpc,
-        sbp=intens_gal_deconv_imcascade,
-        sbp_err=comb_err,
-    )
-    return obs_res, wiener_res, imcascade_res
+    return obs_res, pysersic_res, wiener_res
 
 
 def measure_re_from_img(img, radii=None):
     """Measure the half-light radius using curve of growth."""
+    img = np.nan_to_num(np.asarray(img, dtype=np.float64), nan=0.0)
     center = (img.shape[1] / 2 - 0.5, img.shape[0] / 2 - 0.5)
     if radii is None:
         radii = np.geomspace(1, img.shape[0] / 2 - 1, 50)
+    radii = np.unique(np.asarray(radii, dtype=np.float64))
+    radii = radii[radii > 0]
+    if radii.size == 0:
+        return np.nan
     cog = CurveOfGrowth(img, center, radii)
     cog.normalize()
     re = cog.calc_radius_at_ee(0.5)
-    return re if re is not None else np.nan
+    return float(re) if re is not None else np.nan
 
 
 def measure_re_from_sbp(sbp: SBP):
@@ -150,6 +245,7 @@ def measure_re_from_sbp(sbp: SBP):
     # Convert intensity to flux per annulus
     intens = sbp.sbp  # in counts/s/pixel^2
     sma = sbp.radius  # in pixels
+    axis_ratio = np.clip(sbp.axis_ratio, 0.0, 1.0)
 
     # Calculate annulus boundaries
     # Each annulus i spans from sma[i] to sma[i+1]
@@ -162,8 +258,12 @@ def measure_re_from_sbp(sbp: SBP):
     # Outer edges: sma[i+1]
     r_outer = sma[1:]
 
-    # Calculate annulus areas
-    annulus_areas = np.pi * (r_outer**2 - r_inner**2)  # in pixels^2
+    # Approximate each annulus as an ellipse with the average axis ratio
+    # between its inner and outer sampled isophotes.
+    q_inner = axis_ratio[:-1]
+    q_outer = axis_ratio[1:]
+    q_annulus = 0.5 * (q_inner + q_outer)
+    annulus_areas = np.pi * q_annulus * (r_outer**2 - r_inner**2)  # in pixels^2
 
     # Average intensity in each annulus = mean of intensity at inner and outer edges
     intens_inner = intens[:-1]
@@ -198,6 +298,13 @@ def measure_re_from_sbp(sbp: SBP):
     if fraction_valid[0] > 0.5:
         return radii_valid[0]
 
+    fraction_valid = np.maximum.accumulate(fraction_valid)
+    unique_mask = np.concatenate(([True], np.diff(fraction_valid) > 0))
+    radii_valid = radii_valid[unique_mask]
+    fraction_valid = fraction_valid[unique_mask]
+    if fraction_valid.size < 2:
+        return np.nan
+
     # Use PchipInterpolator to find radius at 50% enclosed energy
     try:
         interp = PchipInterpolator(fraction_valid, radii_valid, extrapolate=False)
@@ -207,101 +314,162 @@ def measure_re_from_sbp(sbp: SBP):
         return np.nan
 
 
-def measure_iso_radius(sbp, iso_sb=26.0):
-    imcascade_sb = intens_to_sb(sbp.sbp)
-    imcascade_radius = sbp.radius
-    while np.any(np.diff(imcascade_sb) < 0):
-        # select only the monotonic part
-        valid_inds = np.where(np.diff(imcascade_sb) > 0)[0] + 1
-        imcascade_sb = imcascade_sb[valid_inds]
-        imcascade_radius = imcascade_radius[valid_inds]
-    try:
-        interp_sb = PchipInterpolator(imcascade_sb, imcascade_radius, extrapolate=True)
-    except ValueError as e:
-        print(np.array(imcascade_sb))
-        print(np.array(imcascade_radius))
-        raise e
-    if float(interp_sb(iso_sb)) < 0:
-        return np.max(imcascade_radius)
-    return float(interp_sb(iso_sb))
+def interpolate_restframe_i_value(group_rows, value_key):
+    """
+    Interpolate one radius-like quantity to rest-frame I.
+
+    Use only the nearest two filters that bracket the target wavelength in
+    log(rest_wavelength) space to reduce sensitivity to outliers in distant
+    bands.
+    """
+    rows = []
+    for row in group_rows:
+        filt = row["filter"]
+        if filt not in REF_WAV:
+            continue
+        value = row[value_key]
+        if not np.isfinite(value):
+            continue
+        rest_wav = REF_WAV[filt] / (1.0 + row["z"])
+        rows.append((rest_wav, value))
+    if len(rows) == 0:
+        return np.nan
+
+    rows.sort(key=lambda item: item[0])
+    rest_wav = np.array([item[0] for item in rows], dtype=np.float64)
+    values = np.array([item[1] for item in rows], dtype=np.float64)
+
+    exact = np.isclose(rest_wav, TARGET_REST_WAV, rtol=0.0, atol=1e-8)
+    if np.any(exact):
+        return float(values[np.where(exact)[0][0]])
+    if TARGET_REST_WAV < rest_wav[0] or TARGET_REST_WAV > rest_wav[-1]:
+        return np.nan
+
+    hi = int(np.searchsorted(rest_wav, TARGET_REST_WAV, side="right"))
+    lo = hi - 1
+    if lo < 0 or hi >= rest_wav.size:
+        return np.nan
+
+    x = np.log10(rest_wav[[lo, hi]])
+    y = values[[lo, hi]]
+    xt = np.log10(TARGET_REST_WAV)
+    return float(np.interp(xt, x, y))
+
+
+def append_restframe_i_rows(results):
+    """Append synthetic rest-frame-I rows to the HLR results."""
+    grouped = defaultdict(list)
+    for row in results:
+        key = (row["z"], row["mstar"], row["q"], row["gal_type"])
+        grouped[key].append(row)
+
+    re_keys = (
+        "re_img",
+        "re_sbp_obs",
+        "re_sbp_deconv",
+        "re_img_wiener",
+        "re_sbp_wiener",
+    )
+    appended = []
+    for (z, mstar, q, gal_type), group_rows in sorted(grouped.items()):
+        interp_values = {
+            key: interpolate_restframe_i_value(group_rows, key) for key in re_keys
+        }
+        if not any(np.isfinite(val) for val in interp_values.values()):
+            continue
+        appended.append(
+            {
+                "z": z,
+                "mstar": mstar,
+                "q": q,
+                "gal_type": gal_type,
+                "pixel_to_kpc": float(group_rows[0]["pixel_to_kpc"]),
+                "filter": RESTFRAME_FILTER_LABEL,
+                **interp_values,
+            }
+        )
+    return results + appended
 
 
 def process_single_measurement(args):
     """Worker function to process a single (z, m, filter) combination."""
-    z1, z2, m1, m2, q1, q2, filter, gal_type = args
+    z1, z2, m1, m2, q1, q2, filter_name, gal_type = args
 
-    avg_z = 0.5 * (z1 + z2)
+    avg_z = midpoint(z1, z2)
     angular_diameter_distance = cosmo.angular_diameter_distance(avg_z)
     pixel_scale_rad = (pixel_scale * u.arcsec).to(u.rad)
     pixel_to_mpc = pixel_scale_rad.value * angular_diameter_distance
     pixel_to_kpc = pixel_to_mpc.to(u.kpc).value
 
-    deconv_asdf_path = (
-        stack_dir
-        / f"stack_{gal_type}_{filter}_{z1}_{z2}_{m1}_{m2}_{q1}_{q2}_subbkg_deconv_imcascade.asdf"
+    deconv_img_path = build_deconv_img_path(
+        z1, z2, m1, m2, q1, q2, filter_name, gal_type
     )
-    deconv_img_path = (
-        stack_dir
-        / f"stack_{gal_type}_{filter}_{z1}_{z2}_{m1}_{m2}_{q1}_{q2}_subbkg_deconv_imcascade.fits"
+    wiener_img_path = build_wiener_img_path(
+        z1, z2, m1, m2, q1, q2, filter_name, gal_type
     )
-    if not deconv_asdf_path.exists() or not deconv_img_path.exists():
-        print(f"Deconvolved image/asdf not found: {deconv_asdf_path}")
-        return None
-
-    obs_sbp, _, imcascade_sbp = get_sbps(z1, z2, m1, m2, q1, q2, filter, gal_type)
-    if obs_sbp is None or obs_sbp.radius.size < 5:
+    if not deconv_img_path.exists() or not wiener_img_path.exists():
         print(
-            f"Insufficient data points in sbp at z: {z1}-{z2}, m: {m1}-{m2}, q: {q1}-{q2}, {filter} band"
+            "Deconvolved image not found:"
+            f" pysersic={deconv_img_path.exists()} ({deconv_img_path}),"
+            f" wiener={wiener_img_path.exists()} ({wiener_img_path})"
         )
         return None
-    # find out radius where sbp drop to 26 mag arcsec^-2
-    rad_26 = measure_iso_radius(imcascade_sbp, iso_sb=26.0)
-    rad_29 = measure_iso_radius(imcascade_sbp, iso_sb=29.0)
 
-    # re from multigaussian fit
-    deconv_res = ImcascadeResults(str(deconv_asdf_path))
-    re_imcascade = deconv_res.calc_r50(cutoff=imcascade_sbp.radius[-1])
+    obs_sbp, pysersic_sbp, wiener_sbp = get_sbps(
+        z1,
+        z2,
+        m1,
+        m2,
+        q1,
+        q2,
+        filter_name,
+        gal_type,
+        use_reference_isophotes=True,
+    )
+    if (
+        obs_sbp is None
+        or pysersic_sbp is None
+        or wiener_sbp is None
+        or obs_sbp.radius.size < 5
+    ):
+        print(
+            f"Insufficient data points in sbp at z: {z1}-{z2}, m: {m1}-{m2}, q: {q1}-{q2}, {filter_name} band"
+        )
+        return None
 
     # re from integrating sbp
     re_sbp_obs = measure_re_from_sbp(obs_sbp)
-    re_sbp_deconv = measure_re_from_sbp(imcascade_sbp)
+    re_sbp_deconv = measure_re_from_sbp(pysersic_sbp)
+    re_sbp_wiener = measure_re_from_sbp(wiener_sbp)
 
-    # re from curve of growth on image
+    # re from curve of growth on the pysersic deconvolved image
     img = fits.getdata(deconv_img_path)
-    re_img = measure_re_from_img(img, radii=imcascade_sbp.radius[1:])
-    idx_26 = (imcascade_sbp.radius <= rad_26) & (imcascade_sbp.radius > 0)
-    radii_26 = imcascade_sbp.radius[idx_26]
-    radii_26 = np.append(radii_26, rad_26)
-    re_img_26 = measure_re_from_img(img, radii=radii_26)
+    re_img = measure_re_from_img(img, radii=pysersic_sbp.radius[1:])
+    wiener_img = fits.getdata(wiener_img_path)
+    re_img_wiener = measure_re_from_img(wiener_img, radii=wiener_sbp.radius[1:])
 
     print(
-        f"z:{z1}-{z2}, m:{m1}-{m2}, q:{q1}-{q2}, {filter}-band "
+        f"z:{z1}-{z2}, m:{m1}-{m2}, q:{q1}-{q2}, {filter_name}-band "
         f"gal_type={gal_type}, "
-        f"r26={rad_26 * pixel_to_kpc:.2f} kpc, "
-        f"r29={rad_29 * pixel_to_kpc:.2f} kpc, "
         f"re_img={re_img * pixel_to_kpc:.2f} kpc, "
-        f"re_img_26={re_img_26 * pixel_to_kpc:.2f} kpc, "
         f"re_sbp_obs={re_sbp_obs * pixel_to_kpc:.2f} kpc, "
         f"re_sbp_deconv={re_sbp_deconv * pixel_to_kpc:.2f} kpc, "
-        f"re_imcascade={re_imcascade * pixel_to_kpc:.2f} kpc"
+        f"re_img_wiener={re_img_wiener * pixel_to_kpc:.2f} kpc, "
+        f"re_sbp_wiener={re_sbp_wiener * pixel_to_kpc:.2f} kpc"
     )
 
     return {
         "z": avg_z,
-        "mstar": 0.5 * (m1 + m2),
-        "q": 0.5 * (q1 + q2),
-        "q1": q1,
-        "q2": q2,
+        "mstar": midpoint(m1, m2),
+        "q": midpoint(q1, q2),
         "gal_type": gal_type,
         "pixel_to_kpc": pixel_to_kpc,
-        "filter": filter,
-        "r26": rad_26,
-        "r29": rad_29,
+        "filter": filter_name,
         "re_img": re_img,
-        "re_img_26": re_img_26,
         "re_sbp_obs": re_sbp_obs,
         "re_sbp_deconv": re_sbp_deconv,
-        "re_imcascade": re_imcascade,
+        "re_img_wiener": re_img_wiener,
+        "re_sbp_wiener": re_sbp_wiener,
     }
 
 
@@ -348,22 +516,19 @@ if __name__ == "__main__":
 
     # Filter out None results and collect data
     results = [r for r in results if r is not None]
+    results = append_restframe_i_rows(results)
 
     zarr = [r["z"] for r in results]
     marr = [r["mstar"] for r in results]
     qarr = [r["q"] for r in results]
-    q1_arr = [r["q1"] for r in results]
-    q2_arr = [r["q2"] for r in results]
     gal_type_arr = [r["gal_type"] for r in results]
     filter_arr = [r["filter"] for r in results]
     pixel_to_kpc_arr = [r["pixel_to_kpc"] for r in results]
-    r26_arr = [r["r26"] for r in results]
-    r29_arr = [r["r29"] for r in results]
     re_img_arr = [r["re_img"] for r in results]
-    re_img_26_arr = [r["re_img_26"] for r in results]
     re_sbp_obs_arr = [r["re_sbp_obs"] for r in results]
     re_sbp_deconv_arr = [r["re_sbp_deconv"] for r in results]
-    re_imcascade_arr = [r["re_imcascade"] for r in results]
+    re_img_wiener_arr = [r["re_img_wiener"] for r in results]
+    re_sbp_wiener_arr = [r["re_sbp_wiener"] for r in results]
 
     # assemble results into a table and save to disk
     result_table = Table(
@@ -371,20 +536,19 @@ if __name__ == "__main__":
             "z": zarr,
             "mstar": marr,
             "q": qarr,
-            "q1": q1_arr,
-            "q2": q2_arr,
             "gal_type": gal_type_arr,
             "filter": filter_arr,
             "pixel_to_kpc": pixel_to_kpc_arr,
-            "r26": r26_arr,
-            "r29": r29_arr,
             "re_img": re_img_arr,
-            "re_img_26": re_img_26_arr,
             "re_sbp_obs": re_sbp_obs_arr,
             "re_sbp_deconv": re_sbp_deconv_arr,
-            "re_imcascade": re_imcascade_arr,
+            "re_img_wiener": re_img_wiener_arr,
+            "re_sbp_wiener": re_sbp_wiener_arr,
         }
     )
+    result_table["z"].info.format = ".2f"
+    result_table["mstar"].info.format = ".2f"
+    result_table["q"].info.format = ".2f"
     result_table.write(
         stack_dir / "hlr.txt", format="ascii.fixed_width", overwrite=True
     )
