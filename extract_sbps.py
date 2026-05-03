@@ -37,11 +37,11 @@ ncores = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
 FILTERS = ("I", "Y", "J", "H")
 GAL_TYPES = ("lcg", "hcg")
 REFERENCE_FILTER = "I"
-DEFAULT_REFERENCE_IMAGE_KIND = "pysersic"
+DEFAULT_REFERENCE_IMAGE_KIND = "imcascade"
 DEFAULT_FIT_SMA0 = 5.0
 REFERENCE_IMAGE_PRODUCTS = {
     "predeconv": ("gal", "_subbkg"),
-    "pysersic": ("gal deconv pysersic", "_subbkg_deconv_pysersic"),
+    "imcascade": ("gal deconv imcascade", "_subbkg_deconv_imcascade"),
     "wiener": ("gal deconv wiener", "_subbkg_deconv_wiener"),
 }
 
@@ -372,8 +372,8 @@ def build_image_product_paths(gal_img_path):
     return {
         "gal+bkg": gal_img_path,
         "gal": gal_img_path.with_stem(gal_img_path.stem + "_subbkg"),
-        "gal deconv pysersic": gal_img_path.with_stem(
-            gal_img_path.stem + "_subbkg_deconv_pysersic"
+        "gal deconv imcascade": gal_img_path.with_stem(
+            gal_img_path.stem + "_subbkg_deconv_imcascade"
         ),
         "gal deconv wiener": gal_img_path.with_stem(
             gal_img_path.stem + "_subbkg_deconv_wiener"
@@ -565,7 +565,7 @@ if __name__ == "__main__":
         help=(
             "Image product used for isophote fitting in each filter: "
             "'predeconv' samples the background-subtracted stack before "
-            "deconvolution, 'pysersic' uses the pysersic deconvolved image, "
+            "deconvolution, 'imcascade' uses the imcascade deconvolved image, "
             "and 'wiener' uses the Wiener deconvolved image."
         ),
     )
