@@ -37,6 +37,12 @@ psf_dir = Path("~/ero_psf").expanduser()
 pixel_scale = 0.3
 psf_oversamp = 3
 psf_scale = pixel_scale / psf_oversamp
+IMCASCADE_XAXIS_PHI = np.pi / 2
+IMCASCADE_PHI_MAX_OFFSET_DEG = 10.0
+IMCASCADE_PHI_BOUNDS = (
+    IMCASCADE_XAXIS_PHI - np.deg2rad(IMCASCADE_PHI_MAX_OFFSET_DEG),
+    IMCASCADE_XAXIS_PHI + np.deg2rad(IMCASCADE_PHI_MAX_OFFSET_DEG),
+)
 DECONV_SUFFIXES = {
     "imcascade": "_deconv_imcascade",
     "wiener": "_deconv_wiener",
@@ -281,6 +287,18 @@ def estimate_galaxy_parameters(gal_img, bad_pix, pixel_scale=0.3, bound_pix_rad=
         f" {gal_re_est} arcsec ({gal_re_est_pix} pixels)"
     )
     return gal_flux_est, gal_re_est, gal_re_est_pix
+
+
+def build_imcascade_sigmas(psf_fwhm_est, pixel_scale, gal_re_est_pix):
+    """Build an imcascade sigma grid with an adaptive central component."""
+    psf_hwhm_pix = psf_fwhm_est / pixel_scale / 2
+    sigma_min = max(
+        0.5 * psf_hwhm_pix,
+        min(psf_hwhm_pix, gal_re_est_pix / 4),
+        0.05,
+    )
+    sigma_max = gal_re_est_pix * 20
+    return np.geomspace(sigma_min, max(sigma_max, sigma_min * 1.01), num=10)
 
 
 def run_pysersic_doublesersic(
@@ -609,12 +627,8 @@ def deconvolve_image(
         outer_q_bounds = (0.2, 1.0)
 
         # imcascade deconvolution
-        num_components = 10
-        sig = np.geomspace(
-            psf_fwhm_est / pixel_scale / 2,
-            gal_re_est_pix * 20,
-            num=num_components,
-        )
+        sig = build_imcascade_sigmas(psf_fwhm_est, pixel_scale, gal_re_est_pix)
+        num_components = len(sig)
         q_logsig_mid_init = float(
             np.clip(np.log10(gal_re_est_pix), np.log10(sig).min(), np.log10(sig).max())
         )
@@ -640,12 +654,12 @@ def deconvolve_image(
                 # imcascade's internal +x is NumPy axis 0; the displayed horizontal
                 # image axis is therefore its +y. phi=pi/2 puts the major axis along
                 # the displayed horizontal axis for the untransposed FITS image.
-                "phi": np.pi / 2,
+                "phi": IMCASCADE_XAXIS_PHI,
             },
             bounds_dict={
                 "x0": (y0_fit - 5, y0_fit + 5),
                 "y0": (x0_fit - 5, x0_fit + 5),
-                "phi": (np.pi / 2 - np.deg2rad(10), np.pi / 2 + np.deg2rad(10)),
+                "phi": IMCASCADE_PHI_BOUNDS,
                 "q_in": (inner_q_low, inner_q_high),
                 "q_out": outer_q_bounds,
             },
@@ -693,7 +707,7 @@ def deconvolve_image(
                 "phi": best_fit_phi,
             },
             bounds_dict={
-                "phi": (np.pi / 2 - np.deg2rad(10), np.pi / 2 + np.deg2rad(10)),
+                "phi": IMCASCADE_PHI_BOUNDS,
                 "q_in": (inner_q_low, inner_q_high),
                 "q_out": outer_q_bounds,
             },
@@ -726,7 +740,7 @@ def deconvolve_image(
                 "phi": best_fit_phi,
             },
             bounds_dict={
-                "phi": (np.pi / 2 - np.deg2rad(10), np.pi / 2 + np.deg2rad(10)),
+                "phi": IMCASCADE_PHI_BOUNDS,
                 "q_in": (inner_q_low, inner_q_high),
                 "q_out": outer_q_bounds,
             },
