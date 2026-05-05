@@ -88,7 +88,7 @@ def build_sbp_path(
 def build_deconv_img_path(z1, z2, m1, m2, q1, q2, filter_name, gal_type):
     return (
         stack_dir
-        / f"stack_{gal_type}_{filter_name}_{z1}_{z2}_{m1}_{m2}_{q1}_{q2}_subbkg_deconv_pysersic.fits"
+        / f"stack_{gal_type}_{filter_name}_{z1}_{z2}_{m1}_{m2}_{q1}_{q2}_subbkg_deconv_imcascade.fits"
     )
 
 
@@ -134,7 +134,7 @@ def get_sbps(
         sbp_gal_table = sbps_dict.tree["gal"]
         sbp_sky_tables = sbps_dict.tree["sky"]
         sbp_bs_tables = sbps_dict.tree["bootstrap"]
-        sbp_gal_deconv_pysersic_table = sbps_dict.tree["gal deconv pysersic"]
+        sbp_gal_deconv_imcascade_table = sbps_dict.tree["gal deconv imcascade"]
         sbp_gal_deconv_wiener_table = sbps_dict.tree["gal deconv wiener"]
 
         sma = np.asarray(sbp_gal_table["sma"], dtype=np.float64)
@@ -144,13 +144,13 @@ def get_sbps(
             0.0,
             1.0,
         )
-        intens_gal_deconv_pysersic = np.asarray(
-            sbp_gal_deconv_pysersic_table["intens"], dtype=np.float64
+        intens_gal_deconv_imcascade = np.asarray(
+            sbp_gal_deconv_imcascade_table["intens"], dtype=np.float64
         )
-        q_gal_deconv_pysersic = np.clip(
+        q_gal_deconv_imcascade = np.clip(
             1.0
             - np.asarray(
-                sbp_gal_deconv_pysersic_table["ellipticity"], dtype=np.float64
+                sbp_gal_deconv_imcascade_table["ellipticity"], dtype=np.float64
             ),
             0.0,
             1.0,
@@ -182,7 +182,7 @@ def get_sbps(
     try:
         rad_max_ind = np.where(
             (intens_gal < nsigma * comb_err)
-            | (intens_gal_deconv_pysersic < nsigma * comb_err)
+            | (intens_gal_deconv_imcascade < nsigma * comb_err)
             | (intens_gal_deconv_wiener < nsigma * comb_err)
         )[0][0]
     except IndexError:
@@ -195,8 +195,8 @@ def get_sbps(
     comb_err = comb_err[:rad_max_ind]
     intens_gal = intens_gal[:rad_max_ind]
     q_gal = q_gal[:rad_max_ind]
-    intens_gal_deconv_pysersic = intens_gal_deconv_pysersic[:rad_max_ind]
-    q_gal_deconv_pysersic = q_gal_deconv_pysersic[:rad_max_ind]
+    intens_gal_deconv_imcascade = intens_gal_deconv_imcascade[:rad_max_ind]
+    q_gal_deconv_imcascade = q_gal_deconv_imcascade[:rad_max_ind]
     intens_gal_deconv_wiener = intens_gal_deconv_wiener[:rad_max_ind]
     q_gal_deconv_wiener = q_gal_deconv_wiener[:rad_max_ind]
 
@@ -207,12 +207,12 @@ def get_sbps(
         sbp_err=comb_err,
         axis_ratio=q_gal,
     )
-    pysersic_res = SBP(
+    imcascade_res = SBP(
         radius=sma,
         radius_kpc=sma_kpc,
-        sbp=intens_gal_deconv_pysersic,
+        sbp=intens_gal_deconv_imcascade,
         sbp_err=comb_err,
-        axis_ratio=q_gal_deconv_pysersic,
+        axis_ratio=q_gal_deconv_imcascade,
     )
     wiener_res = SBP(
         radius=sma,
@@ -221,7 +221,7 @@ def get_sbps(
         sbp_err=comb_err,
         axis_ratio=q_gal_deconv_wiener,
     )
-    return obs_res, pysersic_res, wiener_res
+    return obs_res, imcascade_res, wiener_res
 
 
 def measure_re_from_img(img, radii=None):
@@ -410,12 +410,12 @@ def process_single_measurement(args):
     if not deconv_img_path.exists() or not wiener_img_path.exists():
         print(
             "Deconvolved image not found:"
-            f" pysersic={deconv_img_path.exists()} ({deconv_img_path}),"
+            f" imcascade={deconv_img_path.exists()} ({deconv_img_path}),"
             f" wiener={wiener_img_path.exists()} ({wiener_img_path})"
         )
         return None
 
-    obs_sbp, pysersic_sbp, wiener_sbp = get_sbps(
+    obs_sbp, imcascade_sbp, wiener_sbp = get_sbps(
         z1,
         z2,
         m1,
@@ -428,7 +428,7 @@ def process_single_measurement(args):
     )
     if (
         obs_sbp is None
-        or pysersic_sbp is None
+        or imcascade_sbp is None
         or wiener_sbp is None
         or obs_sbp.radius.size < 5
     ):
@@ -439,12 +439,12 @@ def process_single_measurement(args):
 
     # re from integrating sbp
     re_sbp_obs = measure_re_from_sbp(obs_sbp)
-    re_sbp_deconv = measure_re_from_sbp(pysersic_sbp)
+    re_sbp_deconv = measure_re_from_sbp(imcascade_sbp)
     re_sbp_wiener = measure_re_from_sbp(wiener_sbp)
 
-    # re from curve of growth on the pysersic deconvolved image
+    # re from curve of growth on the imcascade deconvolved image
     img = fits.getdata(deconv_img_path)
-    re_img = measure_re_from_img(img, radii=pysersic_sbp.radius[1:])
+    re_img = measure_re_from_img(img, radii=imcascade_sbp.radius[1:])
     wiener_img = fits.getdata(wiener_img_path)
     re_img_wiener = measure_re_from_img(wiener_img, radii=wiener_sbp.radius[1:])
 
