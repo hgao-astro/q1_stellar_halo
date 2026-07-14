@@ -30,11 +30,13 @@ from measure_hlr import (  # noqa: E402
     build_deconv_img_path,
     get_sbps,
     midpoint,
+    pixel_scale,
     stack_dir,
 )
 
 ncores = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
 hlr_table = Table.read(stack_dir / "hlr.txt", format="ascii.fixed_width")
+profile_center_exclusion = 0.3 / pixel_scale
 
 MODE_LABELS = {
     "profile": "profile_weighted_mean",
@@ -259,9 +261,10 @@ def _measure_ranges(mode, sbp1, sbp2, cp, re_img, rad_10kpc, rad_3sig, n_bootstr
     results = {}
     for seed, (name, radius_in, radius_out) in enumerate(ranges, start=41):
         if mode == "profile":
+            profile_radius_in = max(radius_in, profile_center_exclusion)
             color, color_err = _profile_range_color(
                 cp,
-                radius_in,
+                profile_radius_in,
                 radius_out,
                 n_bootstrap=n_bootstrap,
                 seed=seed,
